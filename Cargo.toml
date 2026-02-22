@@ -1,0 +1,18 @@
+[package]
+name = "einked"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["fontdue"]
+std = []
+fontdue = ["dep:fontdue"]
+
+[dependencies]
+embedded-graphics = "0.8"
+embedded-text = "0.7.3"
+log = "0.4"
+fontdue = { version = "0.9.3", optional = true }
+
+[build-dependencies]
+fontdue = "0.9.3"
