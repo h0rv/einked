@@ -28,11 +28,6 @@ impl TestDisplay {
         }
     }
 
-    /// Create a display matching the Xteink X4 dimensions (480x800).
-    pub fn default_size() -> Self {
-        Self::new(crate::DISPLAY_WIDTH, crate::DISPLAY_HEIGHT)
-    }
-
     /// Count black pixels in the current framebuffer.
     pub fn black_pixel_count(&self) -> usize {
         self.pixels
@@ -103,8 +98,8 @@ mod tests {
     }
 
     #[test]
-    fn test_display_default_size() {
-        let display = TestDisplay::default_size();
+    fn test_display_custom_size() {
+        let display = TestDisplay::new(480, 800);
         assert_eq!(display.size(), Size::new(480, 800));
     }
 }

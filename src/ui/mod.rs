@@ -1,4 +1,4 @@
-//! Minimal, modern UI framework for Xteink X4 e-reader.
+//! Minimal, modern UI framework for embedded-graphics targets.
 //! E-ink optimized: high contrast, no animations, type-safe.
 
 pub mod activity;

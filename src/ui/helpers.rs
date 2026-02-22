@@ -23,8 +23,8 @@ pub const fn enum_from_index<T: Copy, const N: usize>(all: &[T; N], index: usize
 /// Handle standard two-button modal navigation and actions.
 ///
 /// Button mapping:
-/// - Left / VolumeUp: select previous button (wrap)
-/// - Right / VolumeDown: select next button (wrap)
+/// - Left / Aux1: select previous button (wrap)
+/// - Right / Aux2: select next button (wrap)
 /// - Confirm: returns `Confirmed` when index is 1, otherwise `Cancelled`
 /// - Back: returns `Cancelled`
 pub fn handle_two_button_modal_input(
@@ -32,7 +32,7 @@ pub fn handle_two_button_modal_input(
     selected_button: &mut usize,
 ) -> TwoButtonModalInputResult {
     match event {
-        InputEvent::Press(Button::Left) | InputEvent::Press(Button::VolumeUp) => {
+        InputEvent::Press(Button::Left) | InputEvent::Press(Button::Aux1) => {
             if *selected_button > 0 {
                 *selected_button -= 1;
             } else {
@@ -40,7 +40,7 @@ pub fn handle_two_button_modal_input(
             }
             TwoButtonModalInputResult::Consumed
         }
-        InputEvent::Press(Button::Right) | InputEvent::Press(Button::VolumeDown) => {
+        InputEvent::Press(Button::Right) | InputEvent::Press(Button::Aux2) => {
             *selected_button = (*selected_button + 1) % 2;
             TwoButtonModalInputResult::Consumed
         }

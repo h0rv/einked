@@ -15,18 +15,15 @@
     )
 )]
 
-pub mod buffered_display;
+extern crate self as einked;
+
 pub mod diff;
-pub mod embedded_fonts;
-pub mod font_render;
+pub mod dsl;
 pub mod input;
 pub mod test_display;
 pub mod ui;
 
-/// UI display dimensions (portrait mode).
-/// SSD1677 panel is 480x800 pixels in its native orientation.
-pub const DISPLAY_WIDTH: u32 = 480;
-pub const DISPLAY_HEIGHT: u32 = 800;
+pub use einked_macros::ui;
 
 /// Normalize a draw target's size to portrait (width <= height).
 pub fn portrait_dimensions<D: embedded_graphics::prelude::OriginDimensions>(

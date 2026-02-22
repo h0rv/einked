@@ -93,7 +93,7 @@ pub trait Activity<S> {
 
     /// Get the preferred refresh mode for this activity.
     ///
-    /// Called by the firmware after rendering to determine which
+    /// Called by the host runtime after rendering to determine which
     /// e-ink refresh mode to use. Activities can override this
     /// to request full or partial refreshes when needed.
     fn refresh_mode(&self) -> ActivityRefreshMode {

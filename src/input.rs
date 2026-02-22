@@ -1,20 +1,20 @@
-//! Button input abstraction.
+//! Generic button input abstraction.
 
-/// Physical device buttons (directly maps to hardware)
+/// Logical controls exposed by the runtime.
+///
+/// `Aux1..Aux3` are intentionally generic escape hatches for
+/// device-specific buttons without coupling this crate to any board layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Button {
-    // GPIO1 ADC (resistor ladder)
     Left,
     Right,
     Up,
     Down,
     Confirm,
     Back,
-    // GPIO2 ADC (resistor ladder)
-    VolumeUp,
-    VolumeDown,
-    // GPIO3 (digital, active LOW)
-    Power,
+    Aux1,
+    Aux2,
+    Aux3,
 }
 
 /// Input events

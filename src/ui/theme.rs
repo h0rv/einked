@@ -122,7 +122,7 @@ pub fn ui_font_char_width() -> i32 {
 // Single source of truth for every pixel offset in the UI.
 // Change a value here → it changes on every screen.
 
-/// Layout constants for the Xteink X4 (480×800 @ 220 PPI).
+/// Layout constants for a portrait e-ink reader baseline.
 ///
 /// All screens must use these instead of hardcoded magic numbers.
 pub mod layout {
@@ -288,8 +288,7 @@ pub mod layout {
 
 /// UI spacing and sizing metrics (in pixels)
 ///
-/// All values are optimized for the Xteink X4's 480x800 display
-/// at 220 PPI, ensuring comfortable touch targets and readable text.
+/// Values are tuned for a readable portrait e-ink UI and can be overridden.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThemeMetrics {
     /// Header height for navigation bars
@@ -408,7 +407,7 @@ impl Theme {
         Self { metrics }
     }
 
-    /// Get the default theme for Xteink X4
+    /// Get the default theme.
     pub fn default_theme() -> Self {
         Self {
             metrics: ThemeMetrics::default(),
@@ -422,14 +421,11 @@ impl Default for Theme {
     }
 }
 
-/// UI text rendering system - change FONT_NAME to switch fonts globally
+/// UI text rendering helpers.
 pub mod ui_text {
-    use crate::embedded_fonts::EmbeddedFontRegistry;
+    use embedded_graphics::mono_font::MonoTextStyleBuilder;
+    use embedded_graphics::text::Text;
     use embedded_graphics::{pixelcolor::BinaryColor, prelude::*};
-
-    /// **CHANGE THIS to switch fonts everywhere**
-    /// Options: "bookerly-bold", "bookerly-regular", "bookerly-italic", "bookerly-bold-italic"
-    pub const FONT_NAME: &str = "bookerly-regular";
 
     /// Default UI font size
     pub const DEFAULT_SIZE: u32 = 30;
@@ -468,32 +464,26 @@ pub mod ui_text {
         size: Option<u32>,
         color: BinaryColor,
     ) -> Result<i32, D::Error> {
-        let size = size.unwrap_or(DEFAULT_SIZE);
-        if let Some(font) = EmbeddedFontRegistry::get_font_nearest(FONT_NAME, size) {
-            font.draw_text_colored(display, text, x, y, color)
-        } else {
-            Ok(0)
-        }
+        let style = MonoTextStyleBuilder::new()
+            .font(font_for_size(size.unwrap_or(DEFAULT_SIZE)))
+            .text_color(color)
+            .build();
+
+        Text::new(text, Point::new(x, y), style).draw(display)?;
+        Ok(width(text, size) as i32)
     }
 
     /// Measure text width using the configured UI font
     pub fn width(text: &str, size: Option<u32>) -> u32 {
-        let size = size.unwrap_or(DEFAULT_SIZE);
-        if let Some(font) = EmbeddedFontRegistry::get_font_nearest(FONT_NAME, size) {
-            font.text_width(text)
-        } else {
-            0
-        }
+        let font = font_for_size(size.unwrap_or(DEFAULT_SIZE));
+        text.chars().count() as u32 * font.character_size.width
     }
 
     /// Get line height for the configured UI font
     pub fn line_height(size: Option<u32>) -> u8 {
-        let size = size.unwrap_or(DEFAULT_SIZE);
-        if let Some(font) = EmbeddedFontRegistry::get_font_nearest(FONT_NAME, size) {
-            font.line_height
-        } else {
-            size as u8
-        }
+        font_for_size(size.unwrap_or(DEFAULT_SIZE))
+            .character_size
+            .height as u8
     }
 
     /// Calculate Y position to center text vertically in a box
@@ -501,6 +491,16 @@ pub mod ui_text {
         let size = size.unwrap_or(DEFAULT_SIZE);
         let lh = line_height(Some(size)) as i32;
         (box_height as i32 / 2) + (lh / 2)
+    }
+
+    fn font_for_size(size: u32) -> &'static embedded_graphics::mono_font::MonoFont<'static> {
+        if size >= HEADER_SIZE {
+            super::ui_font_title()
+        } else if size <= SMALL_SIZE {
+            super::ui_font_small()
+        } else {
+            super::ui_font_body()
+        }
     }
 }
 
