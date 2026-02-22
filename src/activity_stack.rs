@@ -6,7 +6,7 @@ extern crate alloc;
 use heapless::Vec;
 
 use crate::core::{Rect, Theme};
-use crate::input::InputEvent;
+use crate::input::{InputEvent, InputSource};
 use crate::refresh::RefreshHint;
 use crate::storage::{FileStore, SettingsStore};
 
@@ -114,11 +114,21 @@ impl<T: Theme, const DEPTH: usize> ActivityStack<T, DEPTH> {
 
         self.apply_transition(transition, ctx);
         if let Some(current) = self.stack.last() {
+            ui.set_refresh_hint(current.refresh_hint());
             current.render(ui);
             true
         } else {
             false
         }
+    }
+
+    pub fn tick_source(
+        &mut self,
+        input: &mut impl InputSource,
+        ui: &mut dyn Ui<T>,
+        ctx: &mut Context<'_, T>,
+    ) -> bool {
+        self.tick(input.poll(), ui, ctx)
     }
 
     fn apply_transition(&mut self, transition: Transition<T>, ctx: &mut Context<'_, T>) {
@@ -213,11 +223,22 @@ impl<T: Theme, const DEPTH: usize> ActivityStack<T, DEPTH> {
         };
 
         if let Some(current) = factory.get_mut(current_id) {
+            ui.set_refresh_hint(current.refresh_hint());
             current.render(ui);
             true
         } else {
             false
         }
+    }
+
+    pub fn tick_source<F: ActivityFactory<T>>(
+        &mut self,
+        input: &mut impl InputSource,
+        ui: &mut dyn Ui<T>,
+        factory: &mut F,
+        ctx: &mut Context<'_, T>,
+    ) -> bool {
+        self.tick(input.poll(), ui, factory, ctx)
     }
 
     fn apply_transition<F: ActivityFactory<T>>(
@@ -318,6 +339,7 @@ impl<T: Theme, const DEPTH: usize> Default for ActivityStack<T, DEPTH> {
 #[cfg(all(test, feature = "alloc"))]
 mod tests {
     use alloc::boxed::Box;
+    use core::cell::Cell;
 
     use super::*;
     use crate::core::DefaultTheme;
@@ -345,6 +367,16 @@ mod tests {
     struct DummyUi;
     impl Ui<DefaultTheme> for DummyUi {}
 
+    struct HintUi<'a> {
+        hint: &'a Cell<RefreshHint>,
+    }
+
+    impl Ui<DefaultTheme> for HintUi<'_> {
+        fn set_refresh_hint(&mut self, hint: RefreshHint) {
+            self.hint.set(hint);
+        }
+    }
+
     struct DummyActivity {
         pops: bool,
     }
@@ -362,6 +394,14 @@ mod tests {
             }
         }
         fn render(&self, _ui: &mut dyn Ui<DefaultTheme>) {}
+
+        fn refresh_hint(&self) -> RefreshHint {
+            if self.pops {
+                RefreshHint::Full
+            } else {
+                RefreshHint::Partial
+            }
+        }
     }
 
     #[test]
@@ -393,6 +433,36 @@ mod tests {
             &mut ctx,
         );
         assert!(!alive);
+    }
+
+    #[test]
+    fn stack_propagates_activity_refresh_hint() {
+        let mut stack: ActivityStack<DefaultTheme, 4> = ActivityStack::new();
+        let theme = DefaultTheme;
+        let mut settings = DummySettings;
+        let mut files = DummyFiles;
+        let mut ctx = Context {
+            theme: &theme,
+            screen: crate::core::Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+            settings: &mut settings,
+            files: &mut files,
+        };
+        assert!(
+            stack
+                .push_root(Box::new(DummyActivity { pops: false }), &mut ctx)
+                .is_ok()
+        );
+
+        let captured = Cell::new(RefreshHint::Adaptive);
+        let mut ui = HintUi { hint: &captured };
+        let alive = stack.tick(None, &mut ui, &mut ctx);
+        assert!(alive);
+        assert_eq!(captured.get(), RefreshHint::Partial);
     }
 }
 

@@ -23,6 +23,11 @@ pub enum InputEvent {
     Press(Button),
 }
 
+/// Non-blocking input source abstraction for firmware and simulators.
+pub trait InputSource {
+    fn poll(&mut self) -> Option<InputEvent>;
+}
+
 /// Button remapping configuration.
 ///
 /// Allows users to customize button behavior for accessibility or preference.
