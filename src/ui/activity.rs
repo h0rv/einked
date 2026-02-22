@@ -27,8 +27,8 @@ pub enum ActivityResult<S> {
 ///
 /// # Example
 /// ```ignore
-/// use xteink_ui::ui::{Activity, ActivityResult};
-/// use xteink_ui::input::InputEvent;
+/// use einked::input::{Button, InputEvent};
+/// use einked::ui::{Activity, ActivityResult};
 /// use embedded_graphics::prelude::*;
 /// use embedded_graphics::pixelcolor::BinaryColor;
 ///
@@ -47,7 +47,7 @@ pub enum ActivityResult<S> {
 ///     
 ///     fn handle_input(&mut self, event: InputEvent) -> ActivityResult {
 ///         match event {
-///             InputEvent::Press(xteink_ui::input::Button::Back) => ActivityResult::NavigateBack,
+///             InputEvent::Press(Button::Back) => ActivityResult::NavigateBack,
 ///             _ => ActivityResult::Consumed,
 ///         }
 ///     }

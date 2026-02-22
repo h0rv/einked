@@ -7,18 +7,18 @@
 //! - `ui_font_body()`  — primary content text (medium)
 //! - `ui_font_small()` — secondary/meta text, captions (smallest)
 //!
-//! All three respect the global device font profile set via settings.
+//! All three respect a global host-selected font profile set at runtime.
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use embedded_graphics::mono_font::{MonoFont, ascii};
 
-// Global device-font profile selected from Device Settings.
+// Global font profile selected by the host application.
 // 0..4 maps to increasingly larger font tiers.
 // Default to profile 4 (largest) for optimal e-ink readability.
 static DEVICE_FONT_PROFILE: AtomicU8 = AtomicU8::new(4);
 
-/// Set global UI font profile from settings indices.
+/// Set global UI font profile from host-provided settings indices.
 pub fn set_device_font_profile(font_size_index: usize, font_family_index: usize) {
     let profile = match (font_family_index, font_size_index) {
         // Monospace
