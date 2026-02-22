@@ -17,6 +17,8 @@ use embedded_graphics::{
     primitives::{PrimitiveStyle, Rectangle},
 };
 
+use crate::dsl::UiDsl;
+use crate::ui::runtime::UiRuntime;
 use crate::ui::theme::{Theme, ui_text};
 
 /// Button component with focus state
@@ -123,6 +125,11 @@ impl Button {
         )?;
 
         Ok(())
+    }
+
+    /// Record button content into the command-buffer runtime.
+    pub fn render_to_runtime<const N: usize>(&self, ui: &mut UiRuntime<'_, N>, _theme: &Theme) {
+        ui.label(self.label.as_str());
     }
 }
 
@@ -250,6 +257,18 @@ impl List {
         }
 
         Ok(())
+    }
+
+    /// Record visible list rows into the command-buffer runtime.
+    pub fn render_to_runtime<const N: usize>(&self, ui: &mut UiRuntime<'_, N>, _theme: &Theme) {
+        for item in self
+            .items
+            .iter()
+            .skip(self.scroll_offset)
+            .take(self.visible_count)
+        {
+            ui.label(item.as_str());
+        }
     }
 }
 
@@ -415,6 +434,15 @@ impl Modal {
 
         Ok(())
     }
+
+    /// Record modal title/message/buttons into the command-buffer runtime.
+    pub fn render_to_runtime<const N: usize>(&self, ui: &mut UiRuntime<'_, N>, _theme: &Theme) {
+        ui.label(self.title.as_str());
+        ui.label(self.message.as_str());
+        for label in &self.buttons {
+            ui.label(label.as_str());
+        }
+    }
 }
 
 /// Toast notification for brief messages
@@ -478,6 +506,11 @@ impl Toast {
         )?;
 
         Ok(())
+    }
+
+    /// Record toast message into the command-buffer runtime.
+    pub fn render_to_runtime<const N: usize>(&self, ui: &mut UiRuntime<'_, N>) {
+        ui.label(self.message.as_str());
     }
 }
 
@@ -543,6 +576,12 @@ impl Header {
         .draw(display)?;
 
         Ok(())
+    }
+
+    /// Record header into the command-buffer runtime.
+    pub fn render_to_runtime<const N: usize>(&self, ui: &mut UiRuntime<'_, N>) {
+        let right = self.right_text.as_deref().unwrap_or("");
+        ui.status_bar(self.title.as_str(), right);
     }
 }
 

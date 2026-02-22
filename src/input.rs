@@ -83,3 +83,84 @@ impl ButtonConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn button_config_default_no_remapping() {
+        let config = ButtonConfig::default();
+        assert_eq!(config.remap(Button::Left), Button::Left);
+        assert_eq!(config.remap(Button::Right), Button::Right);
+        assert_eq!(config.remap(Button::Up), Button::Up);
+        assert_eq!(config.remap(Button::Down), Button::Down);
+        assert_eq!(config.remap(Button::Confirm), Button::Confirm);
+        assert_eq!(config.remap(Button::Back), Button::Back);
+        assert_eq!(config.remap(Button::Aux1), Button::Aux1);
+        assert_eq!(config.remap(Button::Aux2), Button::Aux2);
+        assert_eq!(config.remap(Button::Aux3), Button::Aux3);
+    }
+
+    #[test]
+    fn button_config_swap_left_right() {
+        let config = ButtonConfig {
+            swap_left_right: true,
+            ..Default::default()
+        };
+        assert_eq!(config.remap(Button::Left), Button::Right);
+        assert_eq!(config.remap(Button::Right), Button::Left);
+        assert_eq!(config.remap(Button::Up), Button::Up);
+        assert_eq!(config.remap(Button::Down), Button::Down);
+    }
+
+    #[test]
+    fn button_config_swap_up_down() {
+        let config = ButtonConfig {
+            swap_up_down: true,
+            ..Default::default()
+        };
+        assert_eq!(config.remap(Button::Up), Button::Down);
+        assert_eq!(config.remap(Button::Down), Button::Up);
+        assert_eq!(config.remap(Button::Left), Button::Left);
+        assert_eq!(config.remap(Button::Right), Button::Right);
+    }
+
+    #[test]
+    fn button_config_volume_for_pages() {
+        let config = ButtonConfig {
+            volume_for_pages: true,
+            ..Default::default()
+        };
+        assert_eq!(config.remap(Button::Aux1), Button::Left);
+        assert_eq!(config.remap(Button::Aux2), Button::Right);
+        assert_eq!(config.remap(Button::Aux3), Button::Aux3);
+    }
+
+    #[test]
+    fn button_config_combined_remapping() {
+        let config = ButtonConfig {
+            swap_left_right: true,
+            swap_up_down: true,
+            volume_for_pages: true,
+        };
+        // Volume buttons map to Left/Right first, then those get swapped
+        assert_eq!(config.remap(Button::Aux1), Button::Right);
+        assert_eq!(config.remap(Button::Aux2), Button::Left);
+        assert_eq!(config.remap(Button::Left), Button::Right);
+        assert_eq!(config.remap(Button::Right), Button::Left);
+        assert_eq!(config.remap(Button::Up), Button::Down);
+        assert_eq!(config.remap(Button::Down), Button::Up);
+    }
+
+    #[test]
+    fn button_config_remap_event() {
+        let config = ButtonConfig {
+            swap_left_right: true,
+            ..Default::default()
+        };
+        let event = InputEvent::Press(Button::Left);
+        let remapped = config.remap_event(event);
+        assert_eq!(remapped, InputEvent::Press(Button::Right));
+    }
+}

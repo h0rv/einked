@@ -17,9 +17,19 @@
 
 extern crate self as einked;
 
+#[cfg(test)]
+extern crate alloc;
+
+pub mod activity_stack;
+pub mod core;
 pub mod diff;
 pub mod dsl;
 pub mod input;
+pub mod layout;
+pub mod pipeline;
+pub mod refresh;
+pub mod render_ir;
+pub mod storage;
 pub mod test_display;
 pub mod ui;
 

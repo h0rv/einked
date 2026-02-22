@@ -4,11 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-std = []
-default = []
+default = ["alloc"]
+alloc = []
+std = ["alloc"]
 
 [dependencies]
 embedded-graphics = "0.8"
 embedded-text = "0.7.3"
 log = "0.4"
 einked-macros = { path = "einked-macros" }
+heapless = "0.8"
