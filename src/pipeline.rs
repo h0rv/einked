@@ -9,6 +9,7 @@ pub struct FramePipeline<const N: usize, const PREV: usize> {
     current: CmdBuffer<'static, N>,
     previous: CmdBuffer<'static, PREV>,
     scheduler: RefreshScheduler,
+    viewport_width: u16,
 }
 
 impl<const N: usize, const PREV: usize> FramePipeline<N, PREV> {
@@ -17,12 +18,17 @@ impl<const N: usize, const PREV: usize> FramePipeline<N, PREV> {
             current: CmdBuffer::new(),
             previous: CmdBuffer::new(),
             scheduler: RefreshScheduler::new(partial_limit),
+            viewport_width: 480,
         }
+    }
+
+    pub fn set_viewport_width(&mut self, width: u16) {
+        self.viewport_width = width;
     }
 
     pub fn begin_frame(&mut self) -> UiRuntime<'_, N> {
         self.current.clear();
-        UiRuntime::new(&mut self.current, 480)
+        UiRuntime::new(&mut self.current, self.viewport_width)
     }
 
     pub fn end_frame<D: EinkDisplay>(

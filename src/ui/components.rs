@@ -17,6 +17,7 @@ use embedded_graphics::{
     primitives::{PrimitiveStyle, Rectangle},
 };
 
+use crate::core::{Color, Point as UiPoint, Rect};
 use crate::dsl::UiDsl;
 use crate::ui::runtime::UiRuntime;
 use crate::ui::theme::{Theme, ui_text};
@@ -128,8 +129,38 @@ impl Button {
     }
 
     /// Record button content into the command-buffer runtime.
-    pub fn render_to_runtime<const N: usize>(&self, ui: &mut UiRuntime<'_, N>, _theme: &Theme) {
-        ui.label(self.label.as_str());
+    pub fn render_to_runtime<const N: usize>(&self, ui: &mut UiRuntime<'_, N>, theme: &Theme) {
+        let rect = Rect {
+            x: self.x as i16,
+            y: self.y as i16,
+            width: self.width as u16,
+            height: self.height(theme) as u16,
+        };
+        let bg = if self.focused {
+            Color::Black
+        } else {
+            Color::White
+        };
+        ui.fill_rect(rect, bg);
+        ui.draw_line(
+            UiPoint {
+                x: rect.x,
+                y: rect.y + rect.height as i16 - 1,
+            },
+            UiPoint {
+                x: rect.x + rect.width as i16 - 1,
+                y: rect.y + rect.height as i16 - 1,
+            },
+            Color::Black,
+            1,
+        );
+        ui.draw_text_at(
+            UiPoint {
+                x: rect.x + 8,
+                y: rect.y + 18,
+            },
+            self.label.as_str(),
+        );
     }
 }
 
@@ -260,14 +291,35 @@ impl List {
     }
 
     /// Record visible list rows into the command-buffer runtime.
-    pub fn render_to_runtime<const N: usize>(&self, ui: &mut UiRuntime<'_, N>, _theme: &Theme) {
-        for item in self
+    pub fn render_to_runtime<const N: usize>(&self, ui: &mut UiRuntime<'_, N>, theme: &Theme) {
+        let item_height = self.item_height(theme) as i16;
+        for (offset, item) in self
             .items
             .iter()
             .skip(self.scroll_offset)
             .take(self.visible_count)
+            .enumerate()
         {
-            ui.label(item.as_str());
+            let row_y = self.y as i16 + item_height * offset as i16;
+            let selected = self.scroll_offset + offset == self.selected_index;
+            if selected {
+                ui.fill_rect(
+                    Rect {
+                        x: self.x as i16,
+                        y: row_y,
+                        width: self.width as u16,
+                        height: item_height as u16,
+                    },
+                    Color::Black,
+                );
+            }
+            ui.draw_text_at(
+                UiPoint {
+                    x: self.x as i16 + theme.metrics.side_padding as i16,
+                    y: row_y + 16,
+                },
+                item.as_str(),
+            );
         }
     }
 }
@@ -437,10 +489,14 @@ impl Modal {
 
     /// Record modal title/message/buttons into the command-buffer runtime.
     pub fn render_to_runtime<const N: usize>(&self, ui: &mut UiRuntime<'_, N>, _theme: &Theme) {
-        ui.label(self.title.as_str());
-        ui.label(self.message.as_str());
-        for label in &self.buttons {
-            ui.label(label.as_str());
+        ui.status_bar(self.title.as_str(), "");
+        ui.paragraph(self.message.as_str());
+        for (idx, label) in self.buttons.iter().enumerate() {
+            if idx == self.selected_button {
+                ui.with_refresh(crate::dsl::RefreshMode::Fast, |ui| ui.label(label.as_str()));
+            } else {
+                ui.label(label.as_str());
+            }
         }
     }
 }
@@ -510,7 +566,9 @@ impl Toast {
 
     /// Record toast message into the command-buffer runtime.
     pub fn render_to_runtime<const N: usize>(&self, ui: &mut UiRuntime<'_, N>) {
-        ui.label(self.message.as_str());
+        ui.with_refresh(crate::dsl::RefreshMode::Fast, |ui| {
+            ui.paragraph(self.message.as_str());
+        });
     }
 }
 

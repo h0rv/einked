@@ -4,6 +4,10 @@ use heapless::Vec;
 
 use crate::core::{Color, Point, Rect, TextStyle};
 
+/// Maximum inline UTF-8 bytes stored by a draw-text command.
+pub const DRAW_TEXT_CAPACITY: usize = 192;
+pub type DrawTextBuf = heapless::String<DRAW_TEXT_CAPACITY>;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ImageFormat {
     Mono1bpp,
@@ -24,7 +28,7 @@ pub enum DrawCmd<'a> {
     },
     DrawText {
         pos: Point,
-        text: &'a str,
+        text: DrawTextBuf,
         style: TextStyle,
     },
     DrawImage {
@@ -44,6 +48,11 @@ pub struct CmdBuffer<'a, const N: usize> {
     regions: Vec<(Rect, usize), N>,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CmdBufferError {
+    Full,
+}
+
 impl<'a, const N: usize> CmdBuffer<'a, N> {
     pub const fn new() -> Self {
         Self {
@@ -52,14 +61,14 @@ impl<'a, const N: usize> CmdBuffer<'a, N> {
         }
     }
 
-    pub fn push(&mut self, cmd: DrawCmd<'a>, region: Rect) -> Result<(), DrawCmd<'a>> {
+    pub fn push(&mut self, cmd: DrawCmd<'a>, region: Rect) -> Result<(), CmdBufferError> {
         let idx = self.cmds.len();
         if self.cmds.push(cmd.clone()).is_err() {
-            return Err(cmd);
+            return Err(CmdBufferError::Full);
         }
         if self.regions.push((region, idx)).is_err() {
             let _ = self.cmds.pop();
-            return Err(cmd);
+            return Err(CmdBufferError::Full);
         }
         Ok(())
     }

@@ -39,6 +39,18 @@ pub trait UiDsl {
         self.label(text);
     }
 
+    fn text_flow(&mut self, lines: impl core::fmt::Display) {
+        self.paragraph(lines);
+    }
+
+    fn icon(&mut self, name: impl core::fmt::Display, value: impl core::fmt::Display) {
+        self.label(format_args!("[{}:{}]", name, value));
+    }
+
+    fn page_indicator(&mut self, current: impl core::fmt::Display, total: impl core::fmt::Display) {
+        self.label(format_args!("{}/{}", current, total));
+    }
+
     fn with_refresh<F>(&mut self, _mode: RefreshMode, f: F)
     where
         F: FnOnce(&mut Self),

@@ -33,6 +33,17 @@ enum Node {
     Paragraph {
         value: TokenStream2,
     },
+    TextFlow {
+        lines: TokenStream2,
+    },
+    Icon {
+        name: TokenStream2,
+        value: TokenStream2,
+    },
+    PageIndicator {
+        current: TokenStream2,
+        total: TokenStream2,
+    },
     StatusBar {
         left: TokenStream2,
         right: TokenStream2,
@@ -97,11 +108,14 @@ fn parse_node(tokens: &[TokenTree], idx: &mut usize) -> Result<Node, String> {
         "HStack" => parse_stack(tokens, idx, false),
         "Label" => parse_label_like(tokens, idx, "Label", true),
         "Paragraph" => parse_label_like(tokens, idx, "Paragraph", false),
+        "TextFlow" => parse_text_flow(tokens, idx),
+        "Icon" => parse_pair_call(tokens, idx, "Icon"),
+        "PageIndicator" => parse_pair_call(tokens, idx, "PageIndicator"),
         "StatusBar" => parse_status_bar(tokens, idx),
         "Divider" => Ok(Node::Divider),
         "Spacer" => Ok(Node::Spacer),
         _ => Err(format!(
-            "unsupported ui! node `{}` (supported: VStack, HStack, Label, Paragraph, StatusBar, Divider, Spacer)",
+            "unsupported ui! node `{}` (supported: VStack, HStack, Label, Paragraph, TextFlow, Icon, PageIndicator, StatusBar, Divider, Spacer)",
             name
         )),
     }
@@ -174,6 +188,85 @@ fn parse_label_like(
         }
         other => Err(format!("{} requires parentheses, found {:?}", name, other)),
     }
+}
+
+fn parse_pair_call(tokens: &[TokenTree], idx: &mut usize, name: &str) -> Result<Node, String> {
+    let Some(TokenTree::Group(group)) = tokens.get(*idx) else {
+        return Err(format!("{} requires parentheses", name));
+    };
+    if group.delimiter() != Delimiter::Parenthesis {
+        return Err(format!("{} requires parentheses", name));
+    }
+    *idx += 1;
+    let inner: Vec<TokenTree> = group.stream().into_iter().collect();
+    let mut split_at = None;
+    for (i, token) in inner.iter().enumerate() {
+        if let TokenTree::Punct(p) = token {
+            if p.as_char() == ',' {
+                split_at = Some(i);
+                break;
+            }
+        }
+    }
+    let Some(split_at) = split_at else {
+        return Err(format!("{} requires two arguments", name));
+    };
+    let left: TokenStream2 = inner[..split_at].iter().cloned().collect();
+    let right: TokenStream2 = inner[split_at + 1..].iter().cloned().collect();
+    if left.is_empty() || right.is_empty() {
+        return Err(format!("{} requires two non-empty arguments", name));
+    }
+    match name {
+        "Icon" => Ok(Node::Icon {
+            name: left,
+            value: right,
+        }),
+        "PageIndicator" => Ok(Node::PageIndicator {
+            current: left,
+            total: right,
+        }),
+        _ => Err(format!("unsupported pair node {}", name)),
+    }
+}
+
+fn parse_text_flow(tokens: &[TokenTree], idx: &mut usize) -> Result<Node, String> {
+    let Some(TokenTree::Group(group)) = tokens.get(*idx) else {
+        return Err("TextFlow requires parentheses".into());
+    };
+    if group.delimiter() != Delimiter::Parenthesis {
+        return Err("TextFlow requires parentheses".into());
+    }
+    *idx += 1;
+    let inner: Vec<TokenTree> = group.stream().into_iter().collect();
+    if inner.is_empty() {
+        return Err("TextFlow requires arguments".into());
+    }
+
+    let mut inner_idx = 0usize;
+    if let Some(TokenTree::Ident(ident)) = inner.get(inner_idx) {
+        if ident == "lines" {
+            inner_idx += 1;
+            expect_colon(&inner, &mut inner_idx)?;
+            let start = inner_idx;
+            while inner_idx < inner.len() {
+                if let Some(TokenTree::Punct(p)) = inner.get(inner_idx) {
+                    if p.as_char() == ',' || p.as_char() == ';' {
+                        break;
+                    }
+                }
+                inner_idx += 1;
+            }
+            if start == inner_idx {
+                return Err("TextFlow requires a non-empty `lines:` expression".into());
+            }
+            let lines: TokenStream2 = inner[start..inner_idx].iter().cloned().collect();
+            return Ok(Node::TextFlow { lines });
+        }
+    }
+
+    Ok(Node::TextFlow {
+        lines: group.stream(),
+    })
 }
 
 fn parse_status_bar(tokens: &[TokenTree], idx: &mut usize) -> Result<Node, String> {
@@ -419,6 +512,9 @@ fn emit_node(node: &Node) -> TokenStream2 {
         }
         Node::Label { value } => quote!(ui.label(#value);),
         Node::Paragraph { value } => quote!(ui.paragraph(#value);),
+        Node::TextFlow { lines } => quote!(ui.text_flow(#lines);),
+        Node::Icon { name, value } => quote!(ui.icon(#name, #value);),
+        Node::PageIndicator { current, total } => quote!(ui.page_indicator(#current, #total);),
         Node::StatusBar { left, right } => quote!(ui.status_bar(#left, #right);),
         Node::Divider => quote!(ui.divider();),
         Node::Spacer => quote!(ui.spacer();),
@@ -481,14 +577,20 @@ mod tests {
             Divider
             StatusBar { left: "L", right: "R" }
             Paragraph("body")
+            TextFlow(lines: &self.lines, style: theme.body(), fill)
+            Icon(BATTERY, self.battery)
+            PageIndicator(self.page, self.total)
         })
         .expect("parse should succeed");
 
-        assert_eq!(nodes.len(), 3);
+        assert_eq!(nodes.len(), 6);
         assert!(matches!(nodes[0].refresh, Some(RefreshMode::Full)));
         assert!(matches!(nodes[0].node, Node::Divider));
         assert!(matches!(nodes[1].node, Node::StatusBar { .. }));
         assert!(matches!(nodes[2].node, Node::Paragraph { .. }));
+        assert!(matches!(nodes[3].node, Node::TextFlow { .. }));
+        assert!(matches!(nodes[4].node, Node::Icon { .. }));
+        assert!(matches!(nodes[5].node, Node::PageIndicator { .. }));
     }
 
     #[test]
@@ -498,6 +600,9 @@ mod tests {
             StatusBar { left: "L", right: "R" }
             Divider
             Paragraph("P")
+            TextFlow(lines: &self.page_lines, style: theme.body(), fill)
+            Icon(BATTERY, self.battery)
+            PageIndicator(self.page, self.total)
         })
         .expect("parse should succeed");
 
@@ -507,6 +612,9 @@ mod tests {
         assert!(out.contains("ui . status_bar"));
         assert!(out.contains("ui . divider"));
         assert!(out.contains("ui . paragraph"));
+        assert!(out.contains("ui . text_flow"));
+        assert!(out.contains("ui . icon"));
+        assert!(out.contains("ui . page_indicator"));
     }
 
     #[test]
