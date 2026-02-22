@@ -12,7 +12,16 @@ use crate::storage::{FileStore, SettingsStore};
 
 pub trait Ui<T: Theme> {
     fn clear(&mut self, _theme: &T) {}
+    fn label(&mut self, _text: &str) {}
+    fn paragraph(&mut self, text: &str) {
+        self.label(text);
+    }
+    fn divider(&mut self) {}
+    fn status_bar(&mut self, _left: &str, _right: &str) {}
+    fn set_refresh_hint(&mut self, _hint: RefreshHint) {}
 }
+
+impl<T: Theme> Ui<T> for () {}
 
 /// Shared app context passed to lifecycle and input handlers.
 pub struct Context<'a, T: Theme> {
