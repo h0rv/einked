@@ -11,4 +11,4 @@ default = []
 embedded-graphics = "0.8"
 embedded-text = "0.7.3"
 log = "0.4"
-einked-macros = { path = "../einked-macros" }
+einked-macros = { path = "einked-macros" }

@@ -1,0 +1,13 @@
+[package]
+name = "einked-sim-desktop"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "einked-sim-desktop"
+path = "src/main.rs"
+
+[dependencies]
+einked = { path = "../..", features = ["std"] }
+embedded-graphics = "0.8"
+embedded-graphics-simulator = "0.8.0"
