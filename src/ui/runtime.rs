@@ -93,7 +93,7 @@ impl<'rt, const N: usize> UiRuntime<'rt, N> {
     }
 
     pub fn draw_text_at(&mut self, pos: Point, text: &str) {
-        self.push_text(pos, text, default_text_style());
+        let _ = self.push_wrapped_text(pos, text, default_text_style());
     }
 
     pub fn fill_rect(&mut self, rect: Rect, color: Color) {
@@ -332,6 +332,21 @@ mod tests {
         let mut cmds: CmdBuffer<'static, 32> = CmdBuffer::new();
         let mut rt: UiRuntime<'_, 32> = UiRuntime::new(&mut cmds, 64);
         rt.paragraph("one two three four five six seven");
+
+        let text_cmds = rt
+            .cmds
+            .as_slice()
+            .iter()
+            .filter(|cmd| matches!(cmd, DrawCmd::DrawText { .. }))
+            .count();
+        assert!(text_cmds >= 2);
+    }
+
+    #[test]
+    fn draw_text_at_wraps_long_text_into_multiple_commands() {
+        let mut cmds: CmdBuffer<'static, 32> = CmdBuffer::new();
+        let mut rt: UiRuntime<'_, 32> = UiRuntime::new(&mut cmds, 80);
+        rt.draw_text_at(Point { x: 0, y: 20 }, "alpha beta gamma delta epsilon zeta");
 
         let text_cmds = rt
             .cmds

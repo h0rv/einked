@@ -275,6 +275,14 @@ enum ModalState {
         lines: Vec<String>,
         scroll: usize,
     },
+    EpubReader {
+        title: String,
+        path: String,
+        chapter_idx: usize,
+        chapter_count: usize,
+        pages: Vec<Vec<String>>,
+        page_idx: usize,
+    },
     FeedEntries {
         source_idx: usize,
         title: String,
@@ -405,20 +413,15 @@ impl HomeActivity {
         };
         let mut buf = vec![0u8; buf_len];
         let bytes = ctx.files.read(path, &mut buf)?;
-        let lower = path.to_ascii_lowercase();
-        if lower.ends_with(".epub") || lower.ends_with(".epu") {
-            Ok(Self::wrap_reader_lines(self.read_epub_lines(path, bytes)))
-        } else {
-            let text = String::from_utf8_lossy(bytes);
-            let mut lines = Vec::new();
-            for line in text.lines() {
-                lines.push(line.to_string());
-            }
-            if lines.is_empty() {
-                lines.push("(empty file)".to_string());
-            }
-            Ok(Self::wrap_reader_lines(lines))
+        let text = String::from_utf8_lossy(bytes);
+        let mut lines = Vec::new();
+        for line in text.lines() {
+            lines.push(line.to_string());
         }
+        if lines.is_empty() {
+            lines.push("(empty file)".to_string());
+        }
+        Ok(Self::wrap_reader_lines(lines))
     }
 
     fn wrap_reader_lines(lines: Vec<String>) -> Vec<String> {
@@ -497,63 +500,115 @@ impl HomeActivity {
     }
 
     #[cfg(feature = "std")]
-    fn read_epub_lines(&self, _path: &str, bytes: &[u8]) -> Vec<String> {
+    fn parse_epub_chapter_pages(
+        bytes: &[u8],
+        chapter_idx: usize,
+    ) -> Result<(usize, Vec<Vec<String>>), String> {
         let cursor = Cursor::new(bytes.to_vec());
         let mut book = match EpubBook::builder().from_reader(cursor) {
             Ok(book) => book,
             Err(err) => {
-                return vec![format!("Failed to parse EPUB: {}", err)];
+                return Err(format!("Failed to parse EPUB: {}", err));
             }
         };
 
-        if book.chapter_count() == 0 {
-            return vec!["EPUB has no chapters.".to_string()];
+        let chapter_count = book.chapter_count();
+        if chapter_count == 0 {
+            return Err("EPUB has no chapters.".to_string());
+        }
+        if chapter_idx >= chapter_count {
+            return Err("Chapter out of range.".to_string());
         }
 
         let engine = RenderEngine::new(RenderEngineOptions::for_display(448, 700));
-        let pages = match engine.prepare_chapter(&mut book, 0) {
+        let pages = match engine.prepare_chapter(&mut book, chapter_idx) {
             Ok(pages) => pages,
             Err(err) => {
-                return vec![format!("EPUB render failed: {}", err)];
+                return Err(format!("EPUB render failed: {}", err));
             }
         };
-        let mut body = Vec::new();
-        for page in pages.iter().take(3) {
+        let mut out_pages: Vec<Vec<String>> = Vec::new();
+        for page in pages.iter() {
+            let mut page_lines = Vec::new();
             for cmd in &page.content_commands {
                 if let EpubDrawCommand::Text(text) = cmd {
                     let trimmed = text.text.trim();
                     if trimmed.is_empty() || Self::is_epub_boilerplate_line(trimmed) {
                         continue;
                     }
-                    body.push(trimmed.to_string());
-                    if body.len() >= 120 {
-                        break;
-                    }
+                    Self::wrap_single_line(trimmed, 56, &mut page_lines);
                 }
             }
-            if body.len() >= 120 {
-                break;
+            if !page_lines.is_empty() {
+                out_pages.push(page_lines);
             }
         }
-        if !body.is_empty() {
-            let mut lines = vec!["Chapter 1".to_string(), String::new()];
-            lines.extend(body);
-            return lines;
+        if out_pages.is_empty() {
+            return Err("No readable text produced by renderer.".to_string());
         }
-
-        vec!["No readable text produced by renderer.".to_string()]
+        Ok((chapter_count, out_pages))
     }
 
     #[cfg(not(feature = "std"))]
-    fn read_epub_lines(&self, path: &str, bytes: &[u8]) -> Vec<String> {
-        vec![
-            format!("EPUB: {}", path),
-            format!("Size: {} bytes", bytes.len()),
-            "EPUB parsing requires std feature.".to_string(),
-        ]
+    fn parse_epub_chapter_pages(
+        _bytes: &[u8],
+        _chapter_idx: usize,
+    ) -> Result<(usize, Vec<Vec<String>>), String> {
+        Err("EPUB parsing requires std feature.".to_string())
+    }
+
+    fn read_file_bytes<'a>(
+        path: &str,
+        ctx: &mut Context<'_, DefaultTheme>,
+        buf: &'a mut [u8],
+    ) -> Result<&'a [u8], FileStoreError> {
+        ctx.files.read(path, buf)
+    }
+
+    fn load_epub_chapter(
+        path: &str,
+        chapter_idx: usize,
+        ctx: &mut Context<'_, DefaultTheme>,
+    ) -> Result<(usize, Vec<Vec<String>>), String> {
+        let buf_len = if cfg!(target_os = "espidf") {
+            512 * 1024
+        } else {
+            4 * 1024 * 1024
+        };
+        let mut buf = vec![0u8; buf_len];
+        let bytes = Self::read_file_bytes(path, ctx, &mut buf)
+            .map_err(|_| "Failed to read EPUB file.".to_string())?;
+        Self::parse_epub_chapter_pages(bytes, chapter_idx)
+    }
+
+    fn open_epub_in_reader(&mut self, path: &str, ctx: &mut Context<'_, DefaultTheme>) {
+        match Self::load_epub_chapter(path, 0, ctx) {
+            Ok((chapter_count, pages)) => {
+                self.modal = ModalState::EpubReader {
+                    title: path.to_string(),
+                    path: path.to_string(),
+                    chapter_idx: 0,
+                    chapter_count,
+                    pages,
+                    page_idx: 0,
+                };
+            }
+            Err(message) => {
+                self.modal = ModalState::Reader {
+                    title: path.to_string(),
+                    lines: vec![message],
+                    scroll: 0,
+                };
+            }
+        }
     }
 
     fn open_file_in_reader(&mut self, path: &str, ctx: &mut Context<'_, DefaultTheme>) {
+        let lower = path.to_ascii_lowercase();
+        if lower.ends_with(".epub") || lower.ends_with(".epu") {
+            self.open_epub_in_reader(path, ctx);
+            return;
+        }
         match self.read_file_lines(path, ctx) {
             Ok(lines) => {
                 self.modal = ModalState::Reader {
@@ -774,6 +829,36 @@ impl HomeActivity {
         Self::draw_reader_lines(ui_ctx, lines, scroll);
     }
 
+    fn render_epub_reader(
+        &self,
+        ui_ctx: &mut dyn Ui<DefaultTheme>,
+        title: &str,
+        chapter_idx: usize,
+        chapter_count: usize,
+        pages: &[Vec<String>],
+        page_idx: usize,
+    ) {
+        ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "Reader");
+        ui_ctx.draw_line(
+            Point { x: 16, y: 34 },
+            Point { x: 464, y: 34 },
+            Color::Black,
+            1,
+        );
+        ui_ctx.draw_text_at(Point { x: 16, y: 54 }, title);
+        if let Some(lines) = pages.get(page_idx) {
+            Self::draw_reader_lines(ui_ctx, lines, 0);
+        }
+        let footer = format!(
+            "ch {}/{}  p {}/{}",
+            chapter_idx + 1,
+            chapter_count.max(1),
+            page_idx + 1,
+            pages.len().max(1)
+        );
+        ui_ctx.draw_text_at(Point { x: 300, y: 792 }, &footer);
+    }
+
     fn render_bottom_bar(&self, ui_ctx: &mut dyn Ui<DefaultTheme>) {
         ui_ctx.draw_line(
             Point { x: 0, y: 772 },
@@ -784,6 +869,7 @@ impl HomeActivity {
         let left_hint = match self.modal {
             ModalState::Transfer => "Back: Exit transfer",
             ModalState::Reader { .. } => "Back: Close",
+            ModalState::EpubReader { .. } => "Back Close  L/R Page  Vol Ch",
             ModalState::FeedEntries { .. } => "Back: Sources",
             ModalState::FeedItem { .. } => "Back: Entries",
             ModalState::None => match self.tab {
@@ -794,8 +880,10 @@ impl HomeActivity {
             },
         };
         ui_ctx.draw_text_at(Point { x: 14, y: 792 }, left_hint);
-        ui_ctx.draw_text_at(Point { x: 210, y: 792 }, self.tab.dot_label());
-        ui_ctx.draw_text_at(Point { x: 432, y: 792 }, "100%");
+        if !matches!(self.modal, ModalState::EpubReader { .. }) {
+            ui_ctx.draw_text_at(Point { x: 210, y: 792 }, self.tab.dot_label());
+            ui_ctx.draw_text_at(Point { x: 432, y: 792 }, "100%");
+        }
     }
 }
 
@@ -843,6 +931,86 @@ impl Activity<DefaultTheme> for HomeActivity {
                     }
                     InputEvent::Press(Button::Confirm) => {
                         *scroll = (*scroll + 10).min(lines.len().saturating_sub(1));
+                        Transition::Stay
+                    }
+                    _ => Transition::Stay,
+                };
+            }
+            ModalState::EpubReader {
+                path,
+                chapter_idx,
+                chapter_count,
+                pages,
+                page_idx,
+                ..
+            } => {
+                return match event {
+                    InputEvent::Press(Button::Back) => {
+                        self.modal = ModalState::None;
+                        Transition::Stay
+                    }
+                    InputEvent::Press(Button::Left) => {
+                        if *page_idx > 0 {
+                            *page_idx -= 1;
+                            return Transition::Stay;
+                        }
+                        if *chapter_idx > 0 {
+                            let next_chapter = *chapter_idx - 1;
+                            if let Ok((next_count, next_pages)) =
+                                Self::load_epub_chapter(path, next_chapter, ctx)
+                            {
+                                *chapter_count = next_count;
+                                *chapter_idx = next_chapter;
+                                *page_idx = next_pages.len().saturating_sub(1);
+                                *pages = next_pages;
+                            }
+                        }
+                        Transition::Stay
+                    }
+                    InputEvent::Press(Button::Right) => {
+                        if *page_idx + 1 < pages.len() {
+                            *page_idx += 1;
+                            return Transition::Stay;
+                        }
+                        if *chapter_idx + 1 < *chapter_count {
+                            let next_chapter = *chapter_idx + 1;
+                            if let Ok((next_count, next_pages)) =
+                                Self::load_epub_chapter(path, next_chapter, ctx)
+                            {
+                                *chapter_count = next_count;
+                                *chapter_idx = next_chapter;
+                                *page_idx = 0;
+                                *pages = next_pages;
+                            }
+                        }
+                        Transition::Stay
+                    }
+                    InputEvent::Press(Button::Aux1) => {
+                        if *chapter_idx > 0 {
+                            let next_chapter = *chapter_idx - 1;
+                            if let Ok((next_count, next_pages)) =
+                                Self::load_epub_chapter(path, next_chapter, ctx)
+                            {
+                                *chapter_count = next_count;
+                                *chapter_idx = next_chapter;
+                                *page_idx = 0;
+                                *pages = next_pages;
+                            }
+                        }
+                        Transition::Stay
+                    }
+                    InputEvent::Press(Button::Aux2) => {
+                        if *chapter_idx + 1 < *chapter_count {
+                            let next_chapter = *chapter_idx + 1;
+                            if let Ok((next_count, next_pages)) =
+                                Self::load_epub_chapter(path, next_chapter, ctx)
+                            {
+                                *chapter_count = next_count;
+                                *chapter_idx = next_chapter;
+                                *page_idx = 0;
+                                *pages = next_pages;
+                            }
+                        }
                         Transition::Stay
                     }
                     _ => Transition::Stay,
@@ -1022,6 +1190,21 @@ impl Activity<DefaultTheme> for HomeActivity {
                 lines,
                 scroll,
             } => self.render_reader(ui_ctx, title, lines, *scroll),
+            ModalState::EpubReader {
+                title,
+                chapter_idx,
+                chapter_count,
+                pages,
+                page_idx,
+                ..
+            } => self.render_epub_reader(
+                ui_ctx,
+                title,
+                *chapter_idx,
+                *chapter_count,
+                pages,
+                *page_idx,
+            ),
             ModalState::FeedEntries {
                 title,
                 entries,
