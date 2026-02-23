@@ -6,14 +6,13 @@ use alloc::boxed::Box;
 use alloc::format;
 
 use einked::activity_stack::{Activity, ActivityStack, Context, Transition, Ui};
-use einked::core::{DefaultTheme, Rect};
+use einked::core::{Color, DefaultTheme, Point, Rect};
 use einked::dsl::UiDsl;
 use einked::input::{Button, InputEvent};
 use einked::pipeline::FramePipeline;
 use einked::refresh::RefreshHint;
 use einked::render_ir::DrawCmd;
 use einked::storage::{FileStore, FileStoreError, SettingsStore};
-use einked::ui::components::Header;
 use einked::ui::runtime::UiRuntime;
 
 pub mod embedded_fonts;
@@ -122,9 +121,6 @@ impl EreaderRuntime {
             if !alive {
                 return false;
             }
-            Header::new("einked")
-                .with_right_text("ereader")
-                .render_to_runtime(&mut ui.runtime);
             hint = ui.runtime.take_refresh_hint();
         }
 
@@ -163,6 +159,18 @@ impl Ui<DefaultTheme> for RuntimeUi<'_> {
 
     fn set_refresh_hint(&mut self, hint: RefreshHint) {
         self.runtime.set_refresh_hint(hint);
+    }
+
+    fn draw_text_at(&mut self, pos: Point, text: &str) {
+        self.runtime.draw_text_at(pos, text);
+    }
+
+    fn fill_rect(&mut self, rect: Rect, color: Color) {
+        self.runtime.fill_rect(rect, color);
+    }
+
+    fn draw_line(&mut self, start: Point, end: Point, color: Color, width: u8) {
+        self.runtime.draw_line(start, end, color, width);
     }
 }
 
@@ -203,16 +211,169 @@ impl FileStore for NoopFiles {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MainTab {
+    Library,
+    Files,
+    Settings,
+}
+
+impl MainTab {
+    fn next(self) -> Self {
+        match self {
+            Self::Library => Self::Files,
+            Self::Files => Self::Settings,
+            Self::Settings => Self::Library,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            Self::Library => Self::Settings,
+            Self::Files => Self::Library,
+            Self::Settings => Self::Files,
+        }
+    }
+
+    fn dot_label(self) -> &'static str {
+        match self {
+            Self::Library => "O o o",
+            Self::Files => "o O o",
+            Self::Settings => "o o O",
+        }
+    }
+}
+
 struct HomeActivity {
-    selected: usize,
+    tab: MainTab,
+    library_idx: usize,
+    files_idx: usize,
+    settings_idx: usize,
+    transfer_open: bool,
+    transfer_menu_idx: usize,
 }
 
 impl HomeActivity {
     fn new() -> Self {
-        Self { selected: 0 }
+        Self {
+            tab: MainTab::Library,
+            library_idx: 0,
+            files_idx: 0,
+            settings_idx: 0,
+            transfer_open: false,
+            transfer_menu_idx: 0,
+        }
     }
 
-    const ITEMS: [&'static str; 4] = ["Read", "Library", "Settings", "About"];
+    const LIBRARY_ITEMS: [&'static str; 5] = [
+        "Continue: Moby Dick (43%)",
+        "Pride and Prejudice (12%)",
+        "Frankenstein (new)",
+        "The Great Gatsby (7%)",
+        "File Transfer",
+    ];
+    const FILES_ITEMS: [&'static str; 4] = ["books/", "downloads/", "notes/", "samples/"];
+    const SETTINGS_ITEMS: [&'static str; 5] = [
+        "Font Size: Medium",
+        "Font Family: Serif",
+        "Auto Sleep: 10m",
+        "Refresh: Never",
+        "Invert Colors: Off",
+    ];
+    const TRANSFER_ITEMS: [&'static str; 3] = ["Edit AP SSID", "Edit AP Password", "Start/Restart"];
+
+    fn move_up(idx: &mut usize) {
+        *idx = idx.saturating_sub(1);
+    }
+
+    fn move_down(idx: &mut usize, len: usize) {
+        if *idx + 1 < len {
+            *idx += 1;
+        }
+    }
+
+    fn draw_list(ui_ctx: &mut dyn Ui<DefaultTheme>, y_start: i16, selected: usize, items: &[&str]) {
+        for (idx, item) in items.iter().enumerate() {
+            let prefix = if idx == selected { "> " } else { "  " };
+            ui_ctx.draw_text_at(
+                Point {
+                    x: 18,
+                    y: y_start + (idx as i16 * 22),
+                },
+                &format!("{}{}", prefix, item),
+            );
+        }
+    }
+
+    fn render_library(&self, ui_ctx: &mut dyn Ui<DefaultTheme>) {
+        ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "Library");
+        ui_ctx.draw_line(
+            Point { x: 16, y: 34 },
+            Point { x: 464, y: 34 },
+            Color::Black,
+            1,
+        );
+        Self::draw_list(ui_ctx, 66, self.library_idx, &Self::LIBRARY_ITEMS);
+    }
+
+    fn render_files(&self, ui_ctx: &mut dyn Ui<DefaultTheme>) {
+        ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "Files");
+        ui_ctx.draw_line(
+            Point { x: 16, y: 34 },
+            Point { x: 464, y: 34 },
+            Color::Black,
+            1,
+        );
+        Self::draw_list(ui_ctx, 66, self.files_idx, &Self::FILES_ITEMS);
+    }
+
+    fn render_settings(&self, ui_ctx: &mut dyn Ui<DefaultTheme>) {
+        ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "Settings");
+        ui_ctx.draw_line(
+            Point { x: 16, y: 34 },
+            Point { x: 464, y: 34 },
+            Color::Black,
+            1,
+        );
+        Self::draw_list(ui_ctx, 66, self.settings_idx, &Self::SETTINGS_ITEMS);
+    }
+
+    fn render_transfer_screen(&self, ui_ctx: &mut dyn Ui<DefaultTheme>) {
+        ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "File Transfer");
+        ui_ctx.draw_line(
+            Point { x: 16, y: 34 },
+            Point { x: 464, y: 34 },
+            Color::Black,
+            1,
+        );
+        ui_ctx.draw_text_at(Point { x: 18, y: 60 }, "Status: Running");
+        ui_ctx.draw_text_at(Point { x: 18, y: 84 }, "Mode: Hotspot");
+        ui_ctx.draw_text_at(Point { x: 18, y: 108 }, "SSID: Xteink-X4");
+        ui_ctx.draw_text_at(Point { x: 18, y: 132 }, "Password: xteink2026");
+        ui_ctx.draw_text_at(Point { x: 18, y: 156 }, "http://192.168.4.1");
+        Self::draw_list(ui_ctx, 210, self.transfer_menu_idx, &Self::TRANSFER_ITEMS);
+    }
+
+    fn render_bottom_bar(&self, ui_ctx: &mut dyn Ui<DefaultTheme>) {
+        ui_ctx.draw_line(
+            Point { x: 0, y: 772 },
+            Point { x: 479, y: 772 },
+            Color::Black,
+            1,
+        );
+        let left_hint = if self.transfer_open {
+            "Back: Exit transfer"
+        } else {
+            match self.tab {
+                MainTab::Library => "Back: Refresh library",
+                MainTab::Files => "Back: Up",
+                MainTab::Settings => "Back: No-op",
+            }
+        };
+        ui_ctx.draw_text_at(Point { x: 14, y: 792 }, left_hint);
+        ui_ctx.draw_text_at(Point { x: 215, y: 792 }, self.tab.dot_label());
+        ui_ctx.draw_text_at(Point { x: 432, y: 792 }, "100%");
+    }
 }
 
 impl Activity<DefaultTheme> for HomeActivity {
@@ -221,73 +382,89 @@ impl Activity<DefaultTheme> for HomeActivity {
         event: InputEvent,
         _ctx: &mut Context<'_, DefaultTheme>,
     ) -> Transition<DefaultTheme> {
+        if self.transfer_open {
+            return match event {
+                InputEvent::Press(Button::Back) => {
+                    self.transfer_open = false;
+                    Transition::Stay
+                }
+                InputEvent::Press(Button::Up) | InputEvent::Press(Button::Aux1) => {
+                    Self::move_up(&mut self.transfer_menu_idx);
+                    Transition::Stay
+                }
+                InputEvent::Press(Button::Down) | InputEvent::Press(Button::Aux2) => {
+                    Self::move_down(&mut self.transfer_menu_idx, Self::TRANSFER_ITEMS.len());
+                    Transition::Stay
+                }
+                _ => Transition::Stay,
+            };
+        }
+
         match event {
+            InputEvent::Press(Button::Left) => {
+                self.tab = self.tab.prev();
+                Transition::Stay
+            }
+            InputEvent::Press(Button::Right) => {
+                self.tab = self.tab.next();
+                Transition::Stay
+            }
             InputEvent::Press(Button::Up) | InputEvent::Press(Button::Aux1) => {
-                if self.selected == 0 {
-                    self.selected = Self::ITEMS.len() - 1;
-                } else {
-                    self.selected -= 1;
+                match self.tab {
+                    MainTab::Library => Self::move_up(&mut self.library_idx),
+                    MainTab::Files => Self::move_up(&mut self.files_idx),
+                    MainTab::Settings => Self::move_up(&mut self.settings_idx),
                 }
                 Transition::Stay
             }
             InputEvent::Press(Button::Down) | InputEvent::Press(Button::Aux2) => {
-                self.selected = (self.selected + 1) % Self::ITEMS.len();
+                match self.tab {
+                    MainTab::Library => {
+                        Self::move_down(&mut self.library_idx, Self::LIBRARY_ITEMS.len())
+                    }
+                    MainTab::Files => Self::move_down(&mut self.files_idx, Self::FILES_ITEMS.len()),
+                    MainTab::Settings => {
+                        Self::move_down(&mut self.settings_idx, Self::SETTINGS_ITEMS.len())
+                    }
+                }
                 Transition::Stay
             }
-            InputEvent::Press(Button::Confirm) => Transition::Push(Box::new(DetailActivity {
-                ticks: 0,
-                selected: self.selected,
-            })),
+            InputEvent::Press(Button::Confirm) => match self.tab {
+                MainTab::Library if self.library_idx == Self::LIBRARY_ITEMS.len() - 1 => {
+                    self.transfer_open = true;
+                    self.transfer_menu_idx = 0;
+                    Transition::Stay
+                }
+                _ => Transition::Stay,
+            },
             _ => Transition::Stay,
         }
     }
 
     fn render(&self, ui_ctx: &mut dyn Ui<DefaultTheme>) {
-        ui_ctx.status_bar("Home", "Confirm");
-        ui_ctx.divider();
-        for (idx, item) in Self::ITEMS.iter().enumerate() {
-            if idx == self.selected {
-                ui_ctx.label(&format!("> {}", item));
-            } else {
-                ui_ctx.label(item);
+        ui_ctx.fill_rect(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 480,
+                height: 800,
+            },
+            Color::White,
+        );
+
+        if self.transfer_open {
+            self.render_transfer_screen(ui_ctx);
+        } else {
+            match self.tab {
+                MainTab::Library => self.render_library(ui_ctx),
+                MainTab::Files => self.render_files(ui_ctx),
+                MainTab::Settings => self.render_settings(ui_ctx),
             }
         }
+        self.render_bottom_bar(ui_ctx);
     }
 
     fn refresh_hint(&self) -> RefreshHint {
         RefreshHint::Fast
-    }
-}
-
-struct DetailActivity {
-    ticks: u32,
-    selected: usize,
-}
-
-impl Activity<DefaultTheme> for DetailActivity {
-    fn on_input(
-        &mut self,
-        event: InputEvent,
-        _ctx: &mut Context<'_, DefaultTheme>,
-    ) -> Transition<DefaultTheme> {
-        match event {
-            InputEvent::Press(Button::Back) => Transition::Pop,
-            _ => {
-                self.ticks = self.ticks.saturating_add(1);
-                Transition::Stay
-            }
-        }
-    }
-
-    fn render(&self, ui_ctx: &mut dyn Ui<DefaultTheme>) {
-        ui_ctx.status_bar("Detail", "Back");
-        ui_ctx.divider();
-        ui_ctx.paragraph("einked-ereader app runtime");
-        ui_ctx.label(&format!("selected item index: {}", self.selected));
-        ui_ctx.label(&format!("ticks: {}", self.ticks));
-    }
-
-    fn refresh_hint(&self) -> RefreshHint {
-        RefreshHint::Adaptive
     }
 }

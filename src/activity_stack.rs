@@ -5,7 +5,7 @@ extern crate alloc;
 
 use heapless::Vec;
 
-use crate::core::{Rect, Theme};
+use crate::core::{Color, Point, Rect, Theme};
 use crate::input::{InputEvent, InputSource};
 use crate::refresh::RefreshHint;
 use crate::storage::{FileStore, SettingsStore};
@@ -19,6 +19,9 @@ pub trait Ui<T: Theme> {
     fn divider(&mut self) {}
     fn status_bar(&mut self, _left: &str, _right: &str) {}
     fn set_refresh_hint(&mut self, _hint: RefreshHint) {}
+    fn draw_text_at(&mut self, _pos: Point, _text: &str) {}
+    fn fill_rect(&mut self, _rect: Rect, _color: Color) {}
+    fn draw_line(&mut self, _start: Point, _end: Point, _color: Color, _width: u8) {}
 }
 
 impl<T: Theme> Ui<T> for () {}
