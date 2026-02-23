@@ -433,22 +433,22 @@ impl HomeActivity {
         let mut rendered = false;
         if book.chapter_count() > 0 {
             let engine = RenderEngine::new(RenderEngineOptions::for_display(448, 700));
-            if let Ok(pages) = engine.prepare_chapter(&mut book, 0) {
-                if let Some(first_page) = pages.first() {
-                    lines.push("Chapter 1 (rendered page):".to_string());
-                    for cmd in &first_page.content_commands {
-                        if let EpubDrawCommand::Text(text) = cmd {
-                            let trimmed = text.text.trim();
-                            if !trimmed.is_empty() {
-                                lines.push(trimmed.to_string());
-                            }
-                            if lines.len() >= 120 {
-                                break;
-                            }
+            if let Ok(pages) = engine.prepare_chapter(&mut book, 0)
+                && let Some(first_page) = pages.first()
+            {
+                lines.push("Chapter 1 (rendered page):".to_string());
+                for cmd in &first_page.content_commands {
+                    if let EpubDrawCommand::Text(text) = cmd {
+                        let trimmed = text.text.trim();
+                        if !trimmed.is_empty() {
+                            lines.push(trimmed.to_string());
+                        }
+                        if lines.len() >= 120 {
+                            break;
                         }
                     }
-                    rendered = true;
                 }
+                rendered = true;
             }
         }
 
