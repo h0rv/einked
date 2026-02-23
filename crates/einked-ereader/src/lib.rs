@@ -486,93 +486,102 @@ impl HomeActivity {
         }
     }
 
+    fn is_epub_boilerplate_line(line: &str) -> bool {
+        let lower = line.to_ascii_lowercase();
+        lower.contains("project gutenberg")
+            || lower.contains("gutenberg.org")
+            || lower.contains("*** start")
+            || lower.contains("*** end")
+            || lower.starts_with("title:")
+            || lower.starts_with("author:")
+            || lower.starts_with("release date:")
+            || lower.starts_with("most recently updated:")
+            || lower.starts_with("language:")
+            || lower.starts_with("credits:")
+    }
+
     #[cfg(feature = "std")]
     fn read_epub_lines(&self, path: &str, bytes: &[u8]) -> Vec<String> {
-        let mut lines = Vec::new();
         let cursor = Cursor::new(bytes.to_vec());
         let mut book = match EpubBook::builder().from_reader(cursor) {
             Ok(book) => book,
             Err(err) => {
-                lines.push(format!("EPUB: {}", path));
-                lines.push(format!("Failed to parse EPUB: {}", err));
-                return lines;
+                return vec![
+                    format!("EPUB: {}", path),
+                    format!("Failed to parse EPUB: {}", err),
+                ];
             }
         };
 
-        lines.push(format!("Title: {}", book.title()));
-        lines.push(format!("Author: {}", book.author()));
-        lines.push(format!("Chapters: {}", book.chapter_count()));
-        lines.push(String::new());
-
-        let mut rendered = false;
-        if book.chapter_count() > 0 {
-            let engine = RenderEngine::new(RenderEngineOptions::for_display(448, 700));
-            let render_chapters = book.chapter_count().min(4);
-            for chapter_idx in 0..render_chapters {
-                if let Ok(pages) = engine.prepare_chapter(&mut book, chapter_idx)
-                    && let Some(first_page) = pages.first()
-                {
-                    let mut extracted = 0usize;
-                    for cmd in &first_page.content_commands {
-                        if let EpubDrawCommand::Text(text) = cmd {
-                            let trimmed = text.text.trim();
-                            if !trimmed.is_empty() {
-                                if extracted == 0 {
-                                    lines.push(format!(
-                                        "Chapter {} (rendered page):",
-                                        chapter_idx + 1
-                                    ));
-                                }
-                                lines.push(trimmed.to_string());
-                                extracted += 1;
-                            }
-                            if lines.len() >= 120 {
-                                break;
-                            }
-                        }
-                    }
-                    if extracted > 0 {
-                        rendered = true;
-                        break;
-                    }
-                }
-            }
+        if book.chapter_count() == 0 {
+            return vec![
+                format!("Title: {}", book.title()),
+                "(EPUB has no chapters)".to_string(),
+            ];
         }
 
-        if !rendered && book.chapter_count() > 0 {
-            let text_chapters = book.chapter_count().min(8);
-            for chapter_idx in 0..text_chapters {
-                match book.chapter_text_with_limit(chapter_idx, 48 * 1024) {
-                    Ok(chapter) => {
-                        let mut extracted = 0usize;
-                        for line in chapter
-                            .lines()
-                            .map(str::trim)
-                            .filter(|l| !l.is_empty())
-                            .take(100)
-                        {
-                            if extracted == 0 {
-                                lines.push(format!("Chapter {}:", chapter_idx + 1));
-                            }
-                            lines.push(line.to_string());
-                            extracted += 1;
+        let engine = RenderEngine::new(RenderEngineOptions::for_display(448, 700));
+        let probe_chapters = book.chapter_count().min(12);
+        for chapter_idx in 0..probe_chapters {
+            let Ok(pages) = engine.prepare_chapter(&mut book, chapter_idx) else {
+                continue;
+            };
+            let mut body = Vec::new();
+            for page in pages.iter().take(3) {
+                for cmd in &page.content_commands {
+                    if let EpubDrawCommand::Text(text) = cmd {
+                        let trimmed = text.text.trim();
+                        if trimmed.is_empty() || Self::is_epub_boilerplate_line(trimmed) {
+                            continue;
                         }
-                        if extracted > 0 {
+                        body.push(trimmed.to_string());
+                        if body.len() >= 120 {
                             break;
                         }
                     }
-                    Err(err) => {
-                        lines.push(format!("Failed to read chapter text: {}", err));
-                        break;
-                    }
                 }
+                if body.len() >= 120 {
+                    break;
+                }
+            }
+            if body.len() >= 24 {
+                let mut lines = vec![format!("Chapter {}", chapter_idx + 1), String::new()];
+                lines.extend(body);
+                return lines;
             }
         }
 
-        if lines.len() <= 4 {
-            lines.push("(No readable chapter text found)".to_string());
+        if let Ok(pages) = engine.prepare_chapter(&mut book, 0) {
+            let mut body = Vec::new();
+            for page in pages.iter().take(2) {
+                for cmd in &page.content_commands {
+                    if let EpubDrawCommand::Text(text) = cmd {
+                        let trimmed = text.text.trim();
+                        if trimmed.is_empty() || Self::is_epub_boilerplate_line(trimmed) {
+                            continue;
+                        }
+                        body.push(trimmed.to_string());
+                        if body.len() >= 120 {
+                            break;
+                        }
+                    }
+                }
+                if body.len() >= 120 {
+                    break;
+                }
+            }
+            if !body.is_empty() {
+                let mut lines = vec!["Chapter 1".to_string(), String::new()];
+                lines.extend(body);
+                return lines;
+            }
         }
-        lines
+
+        vec![
+            format!("Title: {}", book.title()),
+            "Unable to render readable chapter content.".to_string(),
+            format!("Path: {}", path),
+        ]
     }
 
     #[cfg(not(feature = "std"))]
