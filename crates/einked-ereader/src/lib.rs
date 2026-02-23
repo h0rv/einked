@@ -1682,9 +1682,8 @@ impl Activity<DefaultTheme> for HomeActivity {
                         self.modal = ModalState::FeedOffline {
                             source_idx,
                             title: self.feed_sources[source_idx].0.clone(),
-                            message:
-                                "Wi-Fi is OFFLINE. Feeds require an active Wi-Fi connection."
-                                    .to_string(),
+                            message: "Wi-Fi is OFFLINE. Feeds require an active Wi-Fi connection."
+                                .to_string(),
                             requested_enable: false,
                         };
                         return Transition::Stay;
