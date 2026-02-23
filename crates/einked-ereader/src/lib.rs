@@ -576,14 +576,13 @@ impl HomeActivity {
     }
 
     fn feed_entries_for_source(&self, source_idx: usize) -> Vec<FeedEntry> {
-        self.fetch_live_feed_entries(source_idx)
-            .unwrap_or_else(|| {
-                vec![FeedEntry {
-                    title: "No entries available".to_string(),
-                    url: None,
-                    summary: Some("Feed load failed or returned no entries.".to_string()),
-                }]
-            })
+        self.fetch_live_feed_entries(source_idx).unwrap_or_else(|| {
+            vec![FeedEntry {
+                title: "No entries available".to_string(),
+                url: None,
+                summary: Some("Feed load failed or returned no entries.".to_string()),
+            }]
+        })
     }
 
     fn draw_list_str(
