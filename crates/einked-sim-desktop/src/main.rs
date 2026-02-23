@@ -54,7 +54,7 @@ fn main() {
             match event {
                 SimulatorEvent::Quit => break 'event_loop,
                 SimulatorEvent::KeyDown { keycode, .. } => {
-                    if keycode == Keycode::Escape {
+                    if keycode == Keycode::Q {
                         break 'event_loop;
                     }
                     if let Some(button) = map_key(keycode) {
@@ -159,8 +159,8 @@ fn map_key(keycode: Keycode) -> Option<Button> {
         Keycode::Down | Keycode::S => Some(Button::Down),
         Keycode::Left | Keycode::A => Some(Button::Left),
         Keycode::Right | Keycode::D => Some(Button::Right),
-        Keycode::Return | Keycode::Space => Some(Button::Confirm),
-        Keycode::Backspace => Some(Button::Back),
+        Keycode::Return | Keycode::KpEnter | Keycode::Space => Some(Button::Confirm),
+        Keycode::Backspace | Keycode::Escape => Some(Button::Back),
         _ => None,
     }
 }

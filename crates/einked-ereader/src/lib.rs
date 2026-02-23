@@ -354,17 +354,25 @@ impl HomeActivity {
 
     fn refresh_files(&mut self, ctx: &mut Context<'_, DefaultTheme>) {
         let mut entries = Vec::new();
-        ctx.files.list("/", &mut |name| {
-            let lower = name.to_ascii_lowercase();
-            if lower.ends_with(".epub")
-                || lower.ends_with(".txt")
-                || lower.ends_with(".md")
-                || lower.ends_with(".epu")
-            {
-                entries.push(name.to_string());
-            }
-        });
+
+        let mut collect_from = |base: &str, prefix: &str| {
+            ctx.files.list(base, &mut |name| {
+                let lower = name.to_ascii_lowercase();
+                if lower.ends_with(".epub")
+                    || lower.ends_with(".txt")
+                    || lower.ends_with(".md")
+                    || lower.ends_with(".epu")
+                {
+                    entries.push(format!("{}{}", prefix, name));
+                }
+            });
+        };
+
+        collect_from("/", "");
+        collect_from("/books", "books/");
+
         entries.sort();
+        entries.dedup();
         if entries.is_empty() {
             entries.push("sample_books/notes.txt".to_string());
             entries.push("sample_books/Frankenstein.epub".to_string());
@@ -394,11 +402,16 @@ impl HomeActivity {
         path: &str,
         ctx: &mut Context<'_, DefaultTheme>,
     ) -> Result<Vec<String>, FileStoreError> {
-        let mut buf = vec![0u8; 512 * 1024];
+        let buf_len = if cfg!(target_os = "espidf") {
+            512 * 1024
+        } else {
+            4 * 1024 * 1024
+        };
+        let mut buf = vec![0u8; buf_len];
         let bytes = ctx.files.read(path, &mut buf)?;
         let lower = path.to_ascii_lowercase();
         if lower.ends_with(".epub") || lower.ends_with(".epu") {
-            Ok(self.read_epub_lines(path, bytes))
+            Ok(Self::wrap_reader_lines(self.read_epub_lines(path, bytes)))
         } else {
             let text = String::from_utf8_lossy(bytes);
             let mut lines = Vec::new();
@@ -408,7 +421,68 @@ impl HomeActivity {
             if lines.is_empty() {
                 lines.push("(empty file)".to_string());
             }
-            Ok(lines)
+            Ok(Self::wrap_reader_lines(lines))
+        }
+    }
+
+    fn wrap_reader_lines(lines: Vec<String>) -> Vec<String> {
+        let max_chars = 56usize;
+        let mut out = Vec::new();
+        for line in lines {
+            Self::wrap_single_line(&line, max_chars, &mut out);
+        }
+        out
+    }
+
+    fn wrap_single_line(line: &str, max_chars: usize, out: &mut Vec<String>) {
+        if line.is_empty() {
+            out.push(String::new());
+            return;
+        }
+
+        let mut current = String::new();
+        let mut current_len = 0usize;
+
+        for word in line.split_whitespace() {
+            let word_len = word.chars().count();
+            let sep = if current_len == 0 { 0 } else { 1 };
+            if current_len + sep + word_len <= max_chars {
+                if sep == 1 {
+                    current.push(' ');
+                }
+                current.push_str(word);
+                current_len += sep + word_len;
+            } else {
+                if !current.is_empty() {
+                    out.push(current.clone());
+                    current.clear();
+                    current_len = 0;
+                }
+                if word_len <= max_chars {
+                    current.push_str(word);
+                    current_len = word_len;
+                } else {
+                    let mut chunk = String::new();
+                    let mut chunk_len = 0usize;
+                    for ch in word.chars() {
+                        if chunk_len >= max_chars {
+                            out.push(chunk.clone());
+                            chunk.clear();
+                            chunk_len = 0;
+                        }
+                        chunk.push(ch);
+                        chunk_len += 1;
+                    }
+                    if !chunk.is_empty() {
+                        current = chunk;
+                        current_len = chunk_len;
+                    }
+                }
+            }
+        }
+
+        if !current.is_empty() {
+            out.push(current);
         }
     }
 
@@ -433,35 +507,56 @@ impl HomeActivity {
         let mut rendered = false;
         if book.chapter_count() > 0 {
             let engine = RenderEngine::new(RenderEngineOptions::for_display(448, 700));
-            if let Ok(pages) = engine.prepare_chapter(&mut book, 0)
-                && let Some(first_page) = pages.first()
-            {
-                lines.push("Chapter 1 (rendered page):".to_string());
-                for cmd in &first_page.content_commands {
-                    if let EpubDrawCommand::Text(text) = cmd {
-                        let trimmed = text.text.trim();
-                        if !trimmed.is_empty() {
-                            lines.push(trimmed.to_string());
-                        }
-                        if lines.len() >= 120 {
-                            break;
+            let render_chapters = book.chapter_count().min(4);
+            for chapter_idx in 0..render_chapters {
+                if let Ok(pages) = engine.prepare_chapter(&mut book, chapter_idx)
+                    && let Some(first_page) = pages.first()
+                {
+                    let mut extracted = 0usize;
+                    for cmd in &first_page.content_commands {
+                        if let EpubDrawCommand::Text(text) = cmd {
+                            let trimmed = text.text.trim();
+                            if !trimmed.is_empty() {
+                                if extracted == 0 {
+                                    lines.push(format!("Chapter {} (rendered page):", chapter_idx + 1));
+                                }
+                                lines.push(trimmed.to_string());
+                                extracted += 1;
+                            }
+                            if lines.len() >= 120 {
+                                break;
+                            }
                         }
                     }
+                    if extracted > 0 {
+                        rendered = true;
+                        break;
+                    }
                 }
-                rendered = true;
             }
         }
 
         if !rendered && book.chapter_count() > 0 {
-            match book.chapter_text_with_limit(0, 48 * 1024) {
-                Ok(chapter) => {
-                    lines.push("Chapter 1:".to_string());
-                    for line in chapter.lines().take(100) {
-                        lines.push(line.to_string());
+            let text_chapters = book.chapter_count().min(8);
+            for chapter_idx in 0..text_chapters {
+                match book.chapter_text_with_limit(chapter_idx, 48 * 1024) {
+                    Ok(chapter) => {
+                        let mut extracted = 0usize;
+                        for line in chapter.lines().map(str::trim).filter(|l| !l.is_empty()).take(100) {
+                            if extracted == 0 {
+                                lines.push(format!("Chapter {}:", chapter_idx + 1));
+                            }
+                            lines.push(line.to_string());
+                            extracted += 1;
+                        }
+                        if extracted > 0 {
+                            break;
+                        }
                     }
-                }
-                Err(err) => {
-                    lines.push(format!("Failed to read chapter text: {}", err));
+                    Err(err) => {
+                        lines.push(format!("Failed to read chapter text: {}", err));
+                        break;
+                    }
                 }
             }
         }
@@ -596,6 +691,7 @@ impl HomeActivity {
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn fetch_live_feed_entries(&self, source_idx: usize) -> Option<Vec<FeedEntry>> {
         let (_, url, _) = self.feed_sources.get(source_idx)?;
+        let base_url = url::Url::parse(url).ok();
         let response = ureq::get(url).call().ok()?;
         let mut body = response.into_body();
         let bytes = body.read_to_vec().ok()?;
@@ -609,7 +705,14 @@ impl HomeActivity {
                     .as_ref()
                     .map(|t| t.content.clone())
                     .unwrap_or_else(|| "Untitled".to_string()),
-                url: entry.links.first().map(|l| l.href.clone()),
+                url: entry.links.first().map(|l| {
+                    if let Some(base) = &base_url
+                        && let Ok(joined) = base.join(&l.href)
+                    {
+                        return joined.to_string();
+                    }
+                    l.href.clone()
+                }),
                 summary: entry.summary.as_ref().map(|s| s.content.clone()),
             });
         }
@@ -848,6 +951,7 @@ impl Activity<DefaultTheme> for HomeActivity {
                         }
                         lines.push(String::new());
                         lines.push("Back returns to entries.".to_string());
+                        lines = Self::wrap_reader_lines(lines);
                         let restore_entries = entries.clone();
                         self.modal = ModalState::FeedItem {
                             source_idx: *source_idx,

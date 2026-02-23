@@ -55,8 +55,10 @@ impl<'rt, const N: usize> UiRuntime<'rt, N> {
     }
 
     pub fn paragraph_styled(&mut self, text: &str, style: TextStyle) {
-        self.push_text(self.cursor, text, style);
-        self.cursor.y += 22;
+        let line_height = style_line_height(style);
+        let lines = self.push_wrapped_text(self.cursor, text, style);
+        let gap = self.stack.last().map(|(gap, _)| *gap as i16).unwrap_or(4);
+        self.cursor.y += (lines as i16 * line_height) + gap;
     }
 
     pub fn draw_status_bar(&mut self, left: &str, right: &str) {
@@ -141,6 +143,77 @@ impl<'rt, const N: usize> UiRuntime<'rt, N> {
             },
             region,
         );
+    }
+
+    fn push_wrapped_text(&mut self, pos: Point, text: &str, style: TextStyle) -> usize {
+        let max_chars = ((self.width.saturating_sub(pos.x.max(0) as u16)) / 8).max(1) as usize;
+        let mut y = pos.y;
+        let line_height = style_line_height(style);
+        let mut emitted = 0usize;
+
+        for raw_line in text.split('\n') {
+            if raw_line.trim().is_empty() {
+                y += line_height;
+                emitted += 1;
+                continue;
+            }
+
+            let mut line = DrawTextBuf::new();
+            let mut line_len = 0usize;
+
+            for word in raw_line.split_whitespace() {
+                let word_len = word.chars().count();
+                let sep = if line_len == 0 { 0 } else { 1 };
+
+                if line_len + sep + word_len <= max_chars {
+                    if sep == 1 {
+                        let _ = line.push(' ');
+                    }
+                    for ch in word.chars() {
+                        if line.push(ch).is_err() {
+                            break;
+                        }
+                    }
+                    line_len += sep + word_len;
+                    continue;
+                }
+
+                if !line.is_empty() {
+                    self.push_text(Point { x: pos.x, y }, line.as_str(), style);
+                    y += line_height;
+                    emitted += 1;
+                    line.clear();
+                    line_len = 0;
+                }
+
+                let mut chunk = DrawTextBuf::new();
+                let mut chunk_len = 0usize;
+                for ch in word.chars() {
+                    if chunk_len >= max_chars {
+                        self.push_text(Point { x: pos.x, y }, chunk.as_str(), style);
+                        y += line_height;
+                        emitted += 1;
+                        chunk.clear();
+                        chunk_len = 0;
+                    }
+                    if chunk.push(ch).is_ok() {
+                        chunk_len += 1;
+                    }
+                }
+                if !chunk.is_empty() {
+                    line = chunk;
+                    line_len = chunk_len;
+                }
+            }
+
+            if !line.is_empty() {
+                self.push_text(Point { x: pos.x, y }, line.as_str(), style);
+                y += line_height;
+                emitted += 1;
+            }
+        }
+
+        emitted.max(1)
     }
 }
 
@@ -237,5 +310,35 @@ fn default_text_style() -> TextStyle {
         letter_spacing: 0,
         weight: FontWeight::Regular,
         style: FontStyle::Normal,
+    }
+}
+
+fn style_line_height(style: TextStyle) -> i16 {
+    match style.line_height {
+        LineHeight::Absolute(px) => px.max(1) as i16,
+        LineHeight::Multiplier(mult) => {
+            let px = (style.size_px * mult).round() as i16;
+            px.max(12)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paragraph_wraps_long_text_into_multiple_commands() {
+        let mut cmds: CmdBuffer<'static, 32> = CmdBuffer::new();
+        let mut rt: UiRuntime<'_, 32> = UiRuntime::new(&mut cmds, 64);
+        rt.paragraph("one two three four five six seven");
+
+        let text_cmds = rt
+            .cmds
+            .as_slice()
+            .iter()
+            .filter(|cmd| matches!(cmd, DrawCmd::DrawText { .. }))
+            .count();
+        assert!(text_cmds >= 2);
     }
 }
