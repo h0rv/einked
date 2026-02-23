@@ -16,9 +16,14 @@ use einked::storage::{FileStore, FileStoreError, SettingsStore};
 use einked::ui::components::Header;
 use einked::ui::runtime::UiRuntime;
 
+pub mod embedded_fonts;
 pub mod feed;
 pub mod feed_browser;
 
+pub use embedded_fonts::{
+    BOOKERLY_BOLD, BOOKERLY_BOLD_ITALIC, BOOKERLY_ITALIC, BOOKERLY_REGULAR, BOOKERLY_SET,
+    EmbeddedFont,
+};
 pub use feed::{
     FeedSource, FeedType, JINA_READER_BASE, OpdsCatalog, OpdsEntry, OpdsLink,
     PRELOADED_OPDS_SOURCES, PRELOADED_RSS_SOURCES, all_preloaded_sources, get_reader_url,
