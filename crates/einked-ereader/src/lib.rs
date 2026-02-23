@@ -16,6 +16,15 @@ use einked::storage::{FileStore, FileStoreError, SettingsStore};
 use einked::ui::components::Header;
 use einked::ui::runtime::UiRuntime;
 
+pub mod feed;
+pub mod feed_browser;
+
+pub use feed::{
+    FeedSource, FeedType, JINA_READER_BASE, OpdsCatalog, OpdsEntry, OpdsLink,
+    PRELOADED_OPDS_SOURCES, PRELOADED_RSS_SOURCES, all_preloaded_sources, get_reader_url,
+};
+pub use feed_browser::{BrowserState, FeedBrowserActivity};
+
 pub trait FrameSink {
     fn render_and_flush(&mut self, cmds: &[DrawCmd<'static>], hint: RefreshHint) -> bool;
 }
