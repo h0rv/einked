@@ -518,7 +518,10 @@ impl HomeActivity {
                             let trimmed = text.text.trim();
                             if !trimmed.is_empty() {
                                 if extracted == 0 {
-                                    lines.push(format!("Chapter {} (rendered page):", chapter_idx + 1));
+                                    lines.push(format!(
+                                        "Chapter {} (rendered page):",
+                                        chapter_idx + 1
+                                    ));
                                 }
                                 lines.push(trimmed.to_string());
                                 extracted += 1;
@@ -542,7 +545,12 @@ impl HomeActivity {
                 match book.chapter_text_with_limit(chapter_idx, 48 * 1024) {
                     Ok(chapter) => {
                         let mut extracted = 0usize;
-                        for line in chapter.lines().map(str::trim).filter(|l| !l.is_empty()).take(100) {
+                        for line in chapter
+                            .lines()
+                            .map(str::trim)
+                            .filter(|l| !l.is_empty())
+                            .take(100)
+                        {
                             if extracted == 0 {
                                 lines.push(format!("Chapter {}:", chapter_idx + 1));
                             }
