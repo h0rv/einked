@@ -4,6 +4,8 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 use einked::activity_stack::{Activity, ActivityStack, Context, Transition, Ui};
 use einked::core::{Color, DefaultTheme, Point, Rect};
@@ -69,22 +71,32 @@ pub struct EreaderRuntime {
     stack: ActivityStack<DefaultTheme, 8>,
     pipeline: FramePipeline<512, 512>,
     theme: DefaultTheme,
-    settings: NoopSettings,
-    files: NoopFiles,
+    settings: Box<dyn SettingsStore>,
+    files: Box<dyn FileStore>,
     config: DeviceConfig,
 }
 
 impl EreaderRuntime {
     pub fn new(config: DeviceConfig) -> Self {
+        Self::with_backends(
+            config,
+            Box::new(NoopSettings::default()),
+            Box::new(NoopFiles),
+        )
+    }
+
+    pub fn with_backends(
+        config: DeviceConfig,
+        mut settings: Box<dyn SettingsStore>,
+        mut files: Box<dyn FileStore>,
+    ) -> Self {
         let mut stack = ActivityStack::new();
         let theme = DefaultTheme;
-        let mut settings = NoopSettings::default();
-        let mut files = NoopFiles;
         let mut ctx = Context {
             theme: &theme,
             screen: config.screen,
-            settings: &mut settings,
-            files: &mut files,
+            settings: settings.as_mut(),
+            files: files.as_mut(),
         };
         let _ = stack.push_root(Box::new(HomeActivity::new()), &mut ctx);
 
@@ -109,8 +121,8 @@ impl EreaderRuntime {
         let mut ctx = Context {
             theme: &self.theme,
             screen: self.config.screen,
-            settings: &mut self.settings,
-            files: &mut self.files,
+            settings: self.settings.as_mut(),
+            files: self.files.as_mut(),
         };
 
         let hint;
@@ -248,6 +260,30 @@ impl MainTab {
     }
 }
 
+enum ModalState {
+    None,
+    Transfer,
+    Reader {
+        title: String,
+        lines: Vec<String>,
+        scroll: usize,
+    },
+    FeedEntries {
+        source_idx: usize,
+        title: String,
+        entries: Vec<String>,
+        selected_idx: usize,
+    },
+    FeedItem {
+        source_idx: usize,
+        title: String,
+        entries: Vec<String>,
+        item_idx: usize,
+        lines: Vec<String>,
+        scroll: usize,
+    },
+}
+
 struct HomeActivity {
     tab: MainTab,
     library_idx: usize,
@@ -255,29 +291,17 @@ struct HomeActivity {
     feed_idx: usize,
     settings_idx: usize,
     transfer_menu_idx: usize,
+    files: Vec<String>,
+    feed_sources: Vec<(String, String, FeedType)>,
     modal: ModalState,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ModalState {
-    None,
-    Transfer,
-    BookDetail {
-        title: &'static str,
-        hint: &'static str,
-    },
-    FeedEntries {
-        source_idx: usize,
-        selected_idx: usize,
-    },
-    FeedItem {
-        source_idx: usize,
-        item_idx: usize,
-    },
 }
 
 impl HomeActivity {
     fn new() -> Self {
+        let mut feed_sources = Vec::new();
+        for (name, url, ty) in all_preloaded_sources() {
+            feed_sources.push((name.to_string(), url.to_string(), ty));
+        }
         Self {
             tab: MainTab::Library,
             library_idx: 0,
@@ -285,31 +309,12 @@ impl HomeActivity {
             feed_idx: 0,
             settings_idx: 0,
             transfer_menu_idx: 0,
+            files: Vec::new(),
+            feed_sources,
             modal: ModalState::None,
         }
     }
 
-    const LIBRARY_ITEMS: [&'static str; 5] = [
-        "Continue: Moby Dick (43%)",
-        "Pride and Prejudice (12%)",
-        "Frankenstein (new)",
-        "The Great Gatsby (7%)",
-        "File Transfer",
-    ];
-    const FILES_ITEMS: [&'static str; 4] = [
-        "Moby-Dick.epub",
-        "Pride-and-Prejudice.epub",
-        "Frankenstein.epub",
-        "notes.txt",
-    ];
-    const FEED_ITEMS: [&'static str; 6] = [
-        "Project Gutenberg (OPDS)",
-        "Standard Ebooks (OPDS)",
-        "Feedbooks (OPDS)",
-        "Hacker News (RSS)",
-        "Hacker News Frontpage (RSS)",
-        "Longform (RSS)",
-    ];
     const SETTINGS_ITEMS: [&'static str; 5] = [
         "Font Size: Medium",
         "Font Family: Serif",
@@ -318,33 +323,6 @@ impl HomeActivity {
         "Invert Colors: Off",
     ];
     const TRANSFER_ITEMS: [&'static str; 3] = ["Edit AP SSID", "Edit AP Password", "Start/Restart"];
-
-    fn feed_entries(source_idx: usize) -> &'static [&'static str] {
-        match source_idx {
-            0 => &["Top Books", "Recently Added", "Fiction"],
-            1 => &["Latest Releases", "Classic Literature", "Collections"],
-            2 => &["Public Domain", "Popular", "New Titles"],
-            3 => &["Top Story", "Second Story", "Third Story"],
-            4 => &["Frontpage #1", "Frontpage #2", "Frontpage #3"],
-            5 => &["Feature Essay", "Interview", "Reading List"],
-            _ => &["Entry 1", "Entry 2"],
-        }
-    }
-
-    fn feed_item_body(source_idx: usize, item_idx: usize) -> &'static str {
-        match source_idx {
-            0..=2 => match item_idx {
-                0 => "Catalog view. Confirm will eventually download/open EPUB.",
-                1 => "Navigation view. Use Back to return to source entries.",
-                _ => "Book list entry from OPDS source.",
-            },
-            _ => match item_idx {
-                0 => "RSS article preview.\n\nUse Back to return to feed entries.",
-                1 => "Second article preview.\n\nConfirm/Back are wired.",
-                _ => "Article preview from RSS source.",
-            },
-        }
-    }
 
     fn move_up(idx: &mut usize) {
         *idx = idx.saturating_sub(1);
@@ -356,7 +334,125 @@ impl HomeActivity {
         }
     }
 
-    fn draw_list(ui_ctx: &mut dyn Ui<DefaultTheme>, y_start: i16, selected: usize, items: &[&str]) {
+    fn library_item_count(&self) -> usize {
+        self.files.len().min(4) + 1
+    }
+
+    fn refresh_files(&mut self, ctx: &mut Context<'_, DefaultTheme>) {
+        let mut entries = Vec::new();
+        ctx.files.list("/", &mut |name| {
+            let lower = name.to_ascii_lowercase();
+            if lower.ends_with(".epub")
+                || lower.ends_with(".txt")
+                || lower.ends_with(".md")
+                || lower.ends_with(".epu")
+            {
+                entries.push(name.to_string());
+            }
+        });
+        entries.sort();
+        if entries.is_empty() {
+            entries.push("sample_books/notes.txt".to_string());
+            entries.push("sample_books/Frankenstein.epub".to_string());
+        }
+        self.files = entries;
+        self.library_idx = self
+            .library_idx
+            .min(self.library_item_count().saturating_sub(1));
+        self.files_idx = self.files_idx.min(self.files.len().saturating_sub(1));
+    }
+
+    fn library_item_label(&self, idx: usize) -> String {
+        if idx >= self.files.len().min(4) {
+            "File Transfer".to_string()
+        } else {
+            let name = &self.files[idx];
+            if idx == 0 {
+                format!("Continue: {}", name)
+            } else {
+                name.clone()
+            }
+        }
+    }
+
+    fn read_file_lines(
+        &self,
+        path: &str,
+        ctx: &mut Context<'_, DefaultTheme>,
+    ) -> Result<Vec<String>, FileStoreError> {
+        let mut buf = vec![0u8; 64 * 1024];
+        let bytes = ctx.files.read(path, &mut buf)?;
+        let lower = path.to_ascii_lowercase();
+        if lower.ends_with(".epub") || lower.ends_with(".epu") {
+            let mut lines = Vec::new();
+            lines.push(format!("EPUB: {}", path));
+            lines.push(format!("Size: {} bytes", bytes.len()));
+            lines.push("EPUB parser hookup in progress.".to_string());
+            lines.push("This file opened successfully.".to_string());
+            Ok(lines)
+        } else {
+            let text = String::from_utf8_lossy(bytes);
+            let mut lines = Vec::new();
+            for line in text.lines() {
+                lines.push(line.to_string());
+            }
+            if lines.is_empty() {
+                lines.push("(empty file)".to_string());
+            }
+            Ok(lines)
+        }
+    }
+
+    fn open_file_in_reader(&mut self, path: &str, ctx: &mut Context<'_, DefaultTheme>) {
+        match self.read_file_lines(path, ctx) {
+            Ok(lines) => {
+                self.modal = ModalState::Reader {
+                    title: path.to_string(),
+                    lines,
+                    scroll: 0,
+                };
+            }
+            Err(_) => {
+                self.modal = ModalState::Reader {
+                    title: path.to_string(),
+                    lines: vec![
+                        "Failed to open file.".to_string(),
+                        "Check storage backend and path.".to_string(),
+                    ],
+                    scroll: 0,
+                };
+            }
+        }
+    }
+
+    fn feed_entries_for_source(&self, source_idx: usize) -> Vec<String> {
+        let mut entries = Vec::new();
+        if let Some((name, _, ty)) = self.feed_sources.get(source_idx) {
+            match ty {
+                FeedType::Opds => {
+                    entries.push(format!("{}: Top", name));
+                    entries.push(format!("{}: Popular", name));
+                    entries.push(format!("{}: New", name));
+                }
+                FeedType::Rss => {
+                    entries.push(format!("{}: Headline 1", name));
+                    entries.push(format!("{}: Headline 2", name));
+                    entries.push(format!("{}: Headline 3", name));
+                }
+            }
+        }
+        if entries.is_empty() {
+            entries.push("No entries".to_string());
+        }
+        entries
+    }
+
+    fn draw_list_str(
+        ui_ctx: &mut dyn Ui<DefaultTheme>,
+        y_start: i16,
+        selected: usize,
+        items: &[String],
+    ) {
         for (idx, item) in items.iter().enumerate() {
             let prefix = if idx == selected { "> " } else { "  " };
             ui_ctx.draw_text_at(
@@ -369,7 +465,26 @@ impl HomeActivity {
         }
     }
 
+    fn draw_reader_lines(ui_ctx: &mut dyn Ui<DefaultTheme>, lines: &[String], scroll: usize) {
+        let start_y = 70i16;
+        let visible = 30usize;
+        let end = (scroll + visible).min(lines.len());
+        for (idx, line) in lines[scroll..end].iter().enumerate() {
+            ui_ctx.draw_text_at(
+                Point {
+                    x: 16,
+                    y: start_y + (idx as i16 * 20),
+                },
+                line,
+            );
+        }
+    }
+
     fn render_library(&self, ui_ctx: &mut dyn Ui<DefaultTheme>) {
+        let mut items = Vec::new();
+        for i in 0..self.library_item_count() {
+            items.push(self.library_item_label(i));
+        }
         ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "Library");
         ui_ctx.draw_line(
             Point { x: 16, y: 34 },
@@ -377,7 +492,7 @@ impl HomeActivity {
             Color::Black,
             1,
         );
-        Self::draw_list(ui_ctx, 66, self.library_idx, &Self::LIBRARY_ITEMS);
+        Self::draw_list_str(ui_ctx, 66, self.library_idx, &items);
     }
 
     fn render_files(&self, ui_ctx: &mut dyn Ui<DefaultTheme>) {
@@ -388,21 +503,18 @@ impl HomeActivity {
             Color::Black,
             1,
         );
-        Self::draw_list(ui_ctx, 66, self.files_idx, &Self::FILES_ITEMS);
-    }
-
-    fn render_settings(&self, ui_ctx: &mut dyn Ui<DefaultTheme>) {
-        ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "Settings");
-        ui_ctx.draw_line(
-            Point { x: 16, y: 34 },
-            Point { x: 464, y: 34 },
-            Color::Black,
-            1,
-        );
-        Self::draw_list(ui_ctx, 66, self.settings_idx, &Self::SETTINGS_ITEMS);
+        Self::draw_list_str(ui_ctx, 66, self.files_idx, &self.files);
     }
 
     fn render_feed(&self, ui_ctx: &mut dyn Ui<DefaultTheme>) {
+        let mut items = Vec::new();
+        for (name, _, ty) in &self.feed_sources {
+            let label = match ty {
+                FeedType::Opds => format!("{} (OPDS)", name),
+                FeedType::Rss => format!("{} (RSS)", name),
+            };
+            items.push(label);
+        }
         ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "Feed");
         ui_ctx.draw_line(
             Point { x: 16, y: 34 },
@@ -410,10 +522,29 @@ impl HomeActivity {
             Color::Black,
             1,
         );
-        Self::draw_list(ui_ctx, 66, self.feed_idx, &Self::FEED_ITEMS);
+        Self::draw_list_str(ui_ctx, 66, self.feed_idx, &items);
+    }
+
+    fn render_settings(&self, ui_ctx: &mut dyn Ui<DefaultTheme>) {
+        let items: Vec<String> = Self::SETTINGS_ITEMS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "Settings");
+        ui_ctx.draw_line(
+            Point { x: 16, y: 34 },
+            Point { x: 464, y: 34 },
+            Color::Black,
+            1,
+        );
+        Self::draw_list_str(ui_ctx, 66, self.settings_idx, &items);
     }
 
     fn render_transfer_screen(&self, ui_ctx: &mut dyn Ui<DefaultTheme>) {
+        let items: Vec<String> = Self::TRANSFER_ITEMS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
         ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "File Transfer");
         ui_ctx.draw_line(
             Point { x: 16, y: 34 },
@@ -426,64 +557,25 @@ impl HomeActivity {
         ui_ctx.draw_text_at(Point { x: 18, y: 108 }, "SSID: Xteink-X4");
         ui_ctx.draw_text_at(Point { x: 18, y: 132 }, "Password: xteink2026");
         ui_ctx.draw_text_at(Point { x: 18, y: 156 }, "http://192.168.4.1");
-        Self::draw_list(ui_ctx, 210, self.transfer_menu_idx, &Self::TRANSFER_ITEMS);
+        Self::draw_list_str(ui_ctx, 210, self.transfer_menu_idx, &items);
     }
 
-    fn render_book_detail(&self, ui_ctx: &mut dyn Ui<DefaultTheme>, title: &str, hint: &str) {
-        ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "Open Book");
-        ui_ctx.draw_line(
-            Point { x: 16, y: 34 },
-            Point { x: 464, y: 34 },
-            Color::Black,
-            1,
-        );
-        ui_ctx.draw_text_at(Point { x: 18, y: 72 }, title);
-        ui_ctx.draw_text_at(Point { x: 18, y: 100 }, hint);
-        ui_ctx.draw_text_at(
-            Point { x: 18, y: 128 },
-            "Reader hookup is next; buttons are active now.",
-        );
-    }
-
-    fn render_feed_entries(
+    fn render_reader(
         &self,
         ui_ctx: &mut dyn Ui<DefaultTheme>,
-        source_idx: usize,
-        selected: usize,
+        title: &str,
+        lines: &[String],
+        scroll: usize,
     ) {
-        ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "Feed Entries");
+        ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "Reader");
         ui_ctx.draw_line(
             Point { x: 16, y: 34 },
             Point { x: 464, y: 34 },
             Color::Black,
             1,
         );
-        ui_ctx.draw_text_at(Point { x: 18, y: 56 }, Self::FEED_ITEMS[source_idx]);
-        Self::draw_list(ui_ctx, 88, selected, Self::feed_entries(source_idx));
-    }
-
-    fn render_feed_item(
-        &self,
-        ui_ctx: &mut dyn Ui<DefaultTheme>,
-        source_idx: usize,
-        item_idx: usize,
-    ) {
-        ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "Feed Item");
-        ui_ctx.draw_line(
-            Point { x: 16, y: 34 },
-            Point { x: 464, y: 34 },
-            Color::Black,
-            1,
-        );
-        ui_ctx.draw_text_at(Point { x: 18, y: 60 }, Self::FEED_ITEMS[source_idx]);
-        ui_ctx.draw_text_at(
-            Point { x: 18, y: 88 },
-            Self::feed_entries(source_idx)[item_idx],
-        );
-        ui_ctx.draw_text_at(
-            Point { x: 18, y: 120 },
-            Self::feed_item_body(source_idx, item_idx),
-        );
+        ui_ctx.draw_text_at(Point { x: 16, y: 54 }, title);
+        Self::draw_reader_lines(ui_ctx, lines, scroll);
     }
 
     fn render_bottom_bar(&self, ui_ctx: &mut dyn Ui<DefaultTheme>) {
@@ -495,7 +587,7 @@ impl HomeActivity {
         );
         let left_hint = match self.modal {
             ModalState::Transfer => "Back: Exit transfer",
-            ModalState::BookDetail { .. } => "Back: Close",
+            ModalState::Reader { .. } => "Back: Close",
             ModalState::FeedEntries { .. } => "Back: Sources",
             ModalState::FeedItem { .. } => "Back: Entries",
             ModalState::None => match self.tab {
@@ -506,18 +598,22 @@ impl HomeActivity {
             },
         };
         ui_ctx.draw_text_at(Point { x: 14, y: 792 }, left_hint);
-        ui_ctx.draw_text_at(Point { x: 215, y: 792 }, self.tab.dot_label());
+        ui_ctx.draw_text_at(Point { x: 210, y: 792 }, self.tab.dot_label());
         ui_ctx.draw_text_at(Point { x: 432, y: 792 }, "100%");
     }
 }
 
 impl Activity<DefaultTheme> for HomeActivity {
+    fn on_enter(&mut self, ctx: &mut Context<'_, DefaultTheme>) {
+        self.refresh_files(ctx);
+    }
+
     fn on_input(
         &mut self,
         event: InputEvent,
-        _ctx: &mut Context<'_, DefaultTheme>,
+        ctx: &mut Context<'_, DefaultTheme>,
     ) -> Transition<DefaultTheme> {
-        match self.modal {
+        match &mut self.modal {
             ModalState::Transfer => {
                 return match event {
                     InputEvent::Press(Button::Back) => {
@@ -535,10 +631,22 @@ impl Activity<DefaultTheme> for HomeActivity {
                     _ => Transition::Stay,
                 };
             }
-            ModalState::BookDetail { .. } => {
+            ModalState::Reader { scroll, lines, .. } => {
                 return match event {
-                    InputEvent::Press(Button::Back) | InputEvent::Press(Button::Confirm) => {
+                    InputEvent::Press(Button::Back) => {
                         self.modal = ModalState::None;
+                        Transition::Stay
+                    }
+                    InputEvent::Press(Button::Up) | InputEvent::Press(Button::Aux1) => {
+                        Self::move_up(scroll);
+                        Transition::Stay
+                    }
+                    InputEvent::Press(Button::Down) | InputEvent::Press(Button::Aux2) => {
+                        Self::move_down(scroll, lines.len());
+                        Transition::Stay
+                    }
+                    InputEvent::Press(Button::Confirm) => {
+                        *scroll = (*scroll + 10).min(lines.len().saturating_sub(1));
                         Transition::Stay
                     }
                     _ => Transition::Stay,
@@ -546,7 +654,9 @@ impl Activity<DefaultTheme> for HomeActivity {
             }
             ModalState::FeedEntries {
                 source_idx,
-                mut selected_idx,
+                entries,
+                selected_idx,
+                ..
             } => {
                 return match event {
                     InputEvent::Press(Button::Back) => {
@@ -554,25 +664,29 @@ impl Activity<DefaultTheme> for HomeActivity {
                         Transition::Stay
                     }
                     InputEvent::Press(Button::Up) | InputEvent::Press(Button::Aux1) => {
-                        Self::move_up(&mut selected_idx);
-                        self.modal = ModalState::FeedEntries {
-                            source_idx,
-                            selected_idx,
-                        };
+                        Self::move_up(selected_idx);
                         Transition::Stay
                     }
                     InputEvent::Press(Button::Down) | InputEvent::Press(Button::Aux2) => {
-                        Self::move_down(&mut selected_idx, Self::feed_entries(source_idx).len());
-                        self.modal = ModalState::FeedEntries {
-                            source_idx,
-                            selected_idx,
-                        };
+                        Self::move_down(selected_idx, entries.len());
                         Transition::Stay
                     }
                     InputEvent::Press(Button::Confirm) => {
+                        let item_idx = *selected_idx;
+                        let title = entries[item_idx].clone();
+                        let lines = vec![
+                            format!("Entry: {}", title),
+                            "Feed item opened.".to_string(),
+                            "Back returns to entries.".to_string(),
+                        ];
+                        let restore_entries = entries.clone();
                         self.modal = ModalState::FeedItem {
-                            source_idx,
-                            item_idx: selected_idx,
+                            source_idx: *source_idx,
+                            title,
+                            entries: restore_entries,
+                            item_idx,
+                            lines,
+                            scroll: 0,
                         };
                         Transition::Stay
                     }
@@ -581,17 +695,30 @@ impl Activity<DefaultTheme> for HomeActivity {
             }
             ModalState::FeedItem {
                 source_idx,
+                entries,
                 item_idx,
+                scroll,
+                lines,
+                ..
             } => {
                 return match event {
                     InputEvent::Press(Button::Back) => {
                         self.modal = ModalState::FeedEntries {
-                            source_idx,
-                            selected_idx: item_idx,
+                            source_idx: *source_idx,
+                            title: self.feed_sources[*source_idx].0.clone(),
+                            entries: entries.clone(),
+                            selected_idx: *item_idx,
                         };
                         Transition::Stay
                     }
-                    InputEvent::Press(Button::Confirm) => Transition::Stay,
+                    InputEvent::Press(Button::Up) | InputEvent::Press(Button::Aux1) => {
+                        Self::move_up(scroll);
+                        Transition::Stay
+                    }
+                    InputEvent::Press(Button::Down) | InputEvent::Press(Button::Aux2) => {
+                        Self::move_down(scroll, lines.len());
+                        Transition::Stay
+                    }
                     _ => Transition::Stay,
                 };
             }
@@ -617,46 +744,55 @@ impl Activity<DefaultTheme> for HomeActivity {
                 Transition::Stay
             }
             InputEvent::Press(Button::Down) | InputEvent::Press(Button::Aux2) => {
+                let library_count = self.library_item_count();
                 match self.tab {
-                    MainTab::Library => {
-                        Self::move_down(&mut self.library_idx, Self::LIBRARY_ITEMS.len())
-                    }
-                    MainTab::Files => Self::move_down(&mut self.files_idx, Self::FILES_ITEMS.len()),
-                    MainTab::Feed => Self::move_down(&mut self.feed_idx, Self::FEED_ITEMS.len()),
+                    MainTab::Library => Self::move_down(&mut self.library_idx, library_count),
+                    MainTab::Files => Self::move_down(&mut self.files_idx, self.files.len()),
+                    MainTab::Feed => Self::move_down(&mut self.feed_idx, self.feed_sources.len()),
                     MainTab::Settings => {
                         Self::move_down(&mut self.settings_idx, Self::SETTINGS_ITEMS.len())
                     }
                 }
                 Transition::Stay
             }
+            InputEvent::Press(Button::Back) => {
+                if self.tab == MainTab::Library {
+                    self.refresh_files(ctx);
+                }
+                Transition::Stay
+            }
             InputEvent::Press(Button::Confirm) => match self.tab {
-                MainTab::Library if self.library_idx == Self::LIBRARY_ITEMS.len() - 1 => {
+                MainTab::Library if self.library_idx + 1 == self.library_item_count() => {
                     self.modal = ModalState::Transfer;
                     self.transfer_menu_idx = 0;
                     Transition::Stay
                 }
                 MainTab::Library => {
-                    self.modal = ModalState::BookDetail {
-                        title: Self::LIBRARY_ITEMS[self.library_idx],
-                        hint: "Confirm: Open  Back: Close",
-                    };
+                    let file_idx = self.library_idx.min(self.files.len().saturating_sub(1));
+                    if let Some(path) = self.files.get(file_idx).cloned() {
+                        self.open_file_in_reader(&path, ctx);
+                    }
                     Transition::Stay
                 }
                 MainTab::Files => {
-                    self.modal = ModalState::BookDetail {
-                        title: Self::FILES_ITEMS[self.files_idx],
-                        hint: "Confirm: Open  Back: Close",
-                    };
+                    if let Some(path) = self.files.get(self.files_idx).cloned() {
+                        self.open_file_in_reader(&path, ctx);
+                    }
                     Transition::Stay
                 }
                 MainTab::Feed => {
+                    let source_idx = self.feed_idx.min(self.feed_sources.len().saturating_sub(1));
+                    let entries = self.feed_entries_for_source(source_idx);
+                    let title = self.feed_sources[source_idx].0.clone();
                     self.modal = ModalState::FeedEntries {
-                        source_idx: self.feed_idx,
+                        source_idx,
+                        title,
+                        entries,
                         selected_idx: 0,
                     };
                     Transition::Stay
                 }
-                _ => Transition::Stay,
+                MainTab::Settings => Transition::Stay,
             },
             _ => Transition::Stay,
         }
@@ -673,17 +809,35 @@ impl Activity<DefaultTheme> for HomeActivity {
             Color::White,
         );
 
-        match self.modal {
+        match &self.modal {
             ModalState::Transfer => self.render_transfer_screen(ui_ctx),
-            ModalState::BookDetail { title, hint } => self.render_book_detail(ui_ctx, title, hint),
+            ModalState::Reader {
+                title,
+                lines,
+                scroll,
+            } => self.render_reader(ui_ctx, title, lines, *scroll),
             ModalState::FeedEntries {
-                source_idx,
+                title,
+                entries,
                 selected_idx,
-            } => self.render_feed_entries(ui_ctx, source_idx, selected_idx),
+                ..
+            } => {
+                ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "Feed Entries");
+                ui_ctx.draw_line(
+                    Point { x: 16, y: 34 },
+                    Point { x: 464, y: 34 },
+                    Color::Black,
+                    1,
+                );
+                ui_ctx.draw_text_at(Point { x: 18, y: 56 }, title);
+                Self::draw_list_str(ui_ctx, 88, *selected_idx, entries);
+            }
             ModalState::FeedItem {
-                source_idx,
-                item_idx,
-            } => self.render_feed_item(ui_ctx, source_idx, item_idx),
+                title,
+                lines,
+                scroll,
+                ..
+            } => self.render_reader(ui_ctx, title, lines, *scroll),
             ModalState::None => match self.tab {
                 MainTab::Library => self.render_library(ui_ctx),
                 MainTab::Files => self.render_files(ui_ctx),
@@ -725,6 +879,7 @@ mod tests {
         let mut settings = NoopSettings::default();
         let mut files = NoopFiles;
         let mut ctx = test_ctx(&mut settings, &mut files);
+        act.on_enter(&mut ctx);
 
         let _ = act.on_input(InputEvent::Press(Button::Right), &mut ctx);
         let _ = act.on_input(InputEvent::Press(Button::Right), &mut ctx);
@@ -750,15 +905,16 @@ mod tests {
         let mut settings = NoopSettings::default();
         let mut files = NoopFiles;
         let mut ctx = test_ctx(&mut settings, &mut files);
+        act.on_enter(&mut ctx);
 
         let _ = act.on_input(InputEvent::Press(Button::Confirm), &mut ctx);
-        assert!(matches!(act.modal, ModalState::BookDetail { .. }));
+        assert!(matches!(act.modal, ModalState::Reader { .. }));
         let _ = act.on_input(InputEvent::Press(Button::Back), &mut ctx);
         assert!(matches!(act.modal, ModalState::None));
 
         let _ = act.on_input(InputEvent::Press(Button::Right), &mut ctx);
         let _ = act.on_input(InputEvent::Press(Button::Down), &mut ctx);
         let _ = act.on_input(InputEvent::Press(Button::Confirm), &mut ctx);
-        assert!(matches!(act.modal, ModalState::BookDetail { .. }));
+        assert!(matches!(act.modal, ModalState::Reader { .. }));
     }
 }

@@ -11,7 +11,9 @@ use einked::core::Color;
 use einked::input::{Button, InputEvent};
 use einked::refresh::RefreshHint;
 use einked::render_ir::DrawCmd;
+use einked::storage::{FileStore, FileStoreError, SettingsStore};
 use einked_ereader::{DeviceConfig, EreaderRuntime, FrameSink};
+use std::path::PathBuf;
 
 struct DesktopSink<'a> {
     display: &'a mut SimulatorDisplay<BinaryColor>,
@@ -31,7 +33,11 @@ fn main() {
     let mut display: SimulatorDisplay<BinaryColor> =
         SimulatorDisplay::new(Size::new(config.screen.width as u32, config.screen.height as u32));
     let mut window = Window::new("einked-ereader (desktop)", &output_settings);
-    let mut runtime = EreaderRuntime::new(config);
+    let mut runtime = EreaderRuntime::with_backends(
+        config,
+        Box::new(DesktopSettings::default()),
+        Box::new(DesktopFiles::new(sample_root())),
+    );
 
     {
         let mut sink = DesktopSink {
@@ -62,6 +68,89 @@ fn main() {
             }
         }
     }
+}
+
+struct DesktopSettings {
+    slots: [u8; 64],
+}
+
+impl Default for DesktopSettings {
+    fn default() -> Self {
+        Self { slots: [0; 64] }
+    }
+}
+
+impl SettingsStore for DesktopSettings {
+    fn load_raw(&self, key: u8, buf: &mut [u8]) -> usize {
+        let idx = key as usize;
+        if idx >= self.slots.len() || buf.is_empty() {
+            return 0;
+        }
+        buf[0] = self.slots[idx];
+        1
+    }
+
+    fn save_raw(&mut self, key: u8, data: &[u8]) {
+        let idx = key as usize;
+        if idx < self.slots.len() && !data.is_empty() {
+            self.slots[idx] = data[0];
+        }
+    }
+}
+
+struct DesktopFiles {
+    root: PathBuf,
+}
+
+impl DesktopFiles {
+    fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    fn resolve(&self, path: &str) -> PathBuf {
+        if path == "/" || path.is_empty() {
+            return self.root.clone();
+        }
+        let trimmed = path.trim_start_matches('/');
+        self.root.join(trimmed)
+    }
+}
+
+impl FileStore for DesktopFiles {
+    fn list(&self, path: &str, out: &mut dyn FnMut(&str)) {
+        let dir = self.resolve(path);
+        if let Ok(read_dir) = std::fs::read_dir(dir) {
+            for entry in read_dir.flatten() {
+                let name = entry.file_name();
+                if let Some(name) = name.to_str() {
+                    out(name);
+                }
+            }
+        }
+    }
+
+    fn read<'a>(&self, path: &str, buf: &'a mut [u8]) -> Result<&'a [u8], FileStoreError> {
+        let full = self.resolve(path);
+        let data = std::fs::read(full).map_err(|_| FileStoreError::Io)?;
+        let n = data.len().min(buf.len());
+        buf[..n].copy_from_slice(&data[..n]);
+        Ok(&buf[..n])
+    }
+
+    fn exists(&self, path: &str) -> bool {
+        self.resolve(path).exists()
+    }
+}
+
+fn sample_root() -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    for rel in ["sample_books", "../sample_books", "../../sample_books"] {
+        let candidate = cwd.join(rel);
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
+    cwd
 }
 
 fn map_key(keycode: Keycode) -> Option<Button> {
