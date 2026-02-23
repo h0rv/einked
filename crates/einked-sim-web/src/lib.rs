@@ -3,87 +3,24 @@ use std::rc::Rc;
 
 use wasm_bindgen::prelude::*;
 
+use embedded_graphics::mono_font::{ascii, MonoTextStyleBuilder};
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
+use embedded_graphics::text::Text;
 use embedded_graphics_web_simulator::{
     display::WebSimulatorDisplay, output_settings::OutputSettingsBuilder,
 };
 
-use einked::input::Button;
-use einked::ui::{Header, List, Theme, Toast};
-
-const DISPLAY_WIDTH: u32 = 480;
-const DISPLAY_HEIGHT: u32 = 800;
+use einked::core::Color;
+use einked::input::{Button, InputEvent};
+use einked::refresh::RefreshHint;
+use einked::render_ir::DrawCmd;
+use einked_ereader::{DeviceConfig, EreaderRuntime, FrameSink};
 
 struct State {
-    theme: Theme,
-    list: List,
-    toast_ticks: u8,
+    runtime: EreaderRuntime,
     display: WebSimulatorDisplay<BinaryColor>,
-}
-
-impl State {
-    fn new(display: WebSimulatorDisplay<BinaryColor>) -> Self {
-        let mut state = Self {
-            theme: Theme::default(),
-            list: List::new(
-                vec![
-                    "Open Book".to_string(),
-                    "Library".to_string(),
-                    "Settings".to_string(),
-                    "About".to_string(),
-                ],
-                20,
-                92,
-                DISPLAY_WIDTH - 40,
-                4,
-            ),
-            toast_ticks: 0,
-            display,
-        };
-        state.render();
-        state
-    }
-
-    fn on_button(&mut self, button: Button) {
-        match button {
-            Button::Up | Button::Aux1 => self.list.select_prev(),
-            Button::Down | Button::Aux2 => self.list.select_next(),
-            Button::Confirm => self.toast_ticks = 20,
-            _ => {}
-        }
-        self.render();
-    }
-
-    fn render(&mut self) {
-        Rectangle::new(Point::new(0, 0), Size::new(DISPLAY_WIDTH, DISPLAY_HEIGHT))
-            .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
-            .draw(&mut self.display)
-            .expect("clear");
-
-        Header::new("einked Web")
-            .with_right_text("demo")
-            .render(&mut self.display, &self.theme)
-            .expect("header");
-        self.list
-            .render(&mut self.display, &self.theme)
-            .expect("list");
-
-        if self.toast_ticks > 0 {
-            let selected = self.list.selected().unwrap_or("-");
-            Toast::bottom_center(
-                &format!("Selected: {}", selected),
-                DISPLAY_WIDTH,
-                DISPLAY_HEIGHT,
-            )
-            .render(&mut self.display)
-            .expect("toast");
-            self.toast_ticks -= 1;
-        }
-
-        self.display.flush().expect("flush");
-    }
 }
 
 #[wasm_bindgen(start)]
@@ -96,30 +33,58 @@ pub fn main() -> Result<(), JsValue> {
         .get_element_by_id("display-container")
         .expect("display-container element");
 
+    let config = DeviceConfig::xteink_x4();
     let output_settings = OutputSettingsBuilder::new().scale(1).build();
     let display = WebSimulatorDisplay::new(
-        (DISPLAY_WIDTH, DISPLAY_HEIGHT),
+        (config.screen.width as u32, config.screen.height as u32),
         &output_settings,
         Some(&container),
     );
 
-    let state = Rc::new(RefCell::new(State::new(display)));
+    let mut init_state = State {
+        runtime: EreaderRuntime::new(config),
+        display,
+    };
+    {
+        let mut sink = StateSink {
+            display: &mut init_state.display,
+        };
+        let _ = init_state.runtime.tick(None, &mut sink);
+    }
+
+    let state = Rc::new(RefCell::new(init_state));
 
     let state_clone = state.clone();
     let closure = Closure::wrap(Box::new(move |e: web_sys::KeyboardEvent| {
         if let Some(btn) = key_to_button(&e.key()) {
             e.prevent_default();
-            state_clone.borrow_mut().on_button(btn);
+            let mut state = state_clone.borrow_mut();
+            let input = Some(InputEvent::Press(btn));
+            let mut sink = StateSink {
+                display: &mut state.display,
+            };
+            let _ = state.runtime.tick(input, &mut sink);
         }
     }) as Box<dyn FnMut(_)>);
 
     window.add_event_listener_with_callback("keydown", closure.as_ref().unchecked_ref())?;
     closure.forget();
 
-    web_sys::console::log_1(&"einked web simulator ready".into());
-    web_sys::console::log_1(&"controls: up/down or w/s, enter".into());
-
+    web_sys::console::log_1(&"einked-ereader web simulator ready".into());
     Ok(())
+}
+
+struct StateSink<'a> {
+    display: &'a mut WebSimulatorDisplay<BinaryColor>,
+}
+
+impl FrameSink for StateSink<'_> {
+    fn render_and_flush(&mut self, cmds: &[DrawCmd<'static>], _hint: RefreshHint) -> bool {
+        self.display.clear(BinaryColor::Off).ok();
+        rasterize_commands(cmds, self.display);
+        self.display.flush().ok();
+        true
+    }
 }
 
 fn key_to_button(key: &str) -> Option<Button> {
@@ -131,5 +96,59 @@ fn key_to_button(key: &str) -> Option<Button> {
         "Enter" | " " => Some(Button::Confirm),
         "Backspace" => Some(Button::Back),
         _ => None,
+    }
+}
+
+fn rasterize_commands(cmds: &[DrawCmd<'static>], display: &mut WebSimulatorDisplay<BinaryColor>) {
+    for cmd in cmds {
+        match cmd {
+            DrawCmd::FillRect { rect, color } => {
+                let draw_color = to_binary(*color);
+                let _ = Rectangle::new(
+                    Point::new(rect.x as i32, rect.y as i32),
+                    Size::new(rect.width as u32, rect.height as u32),
+                )
+                .into_styled(PrimitiveStyle::with_fill(draw_color))
+                .draw(display);
+            }
+            DrawCmd::DrawText { pos, text, .. } => {
+                let style = MonoTextStyleBuilder::new()
+                    .font(&ascii::FONT_8X13_BOLD)
+                    .text_color(BinaryColor::On)
+                    .build();
+                let _ = Text::new(text.as_str(), Point::new(pos.x as i32, pos.y as i32), style)
+                    .draw(display);
+            }
+            DrawCmd::DrawLine {
+                start, end, color, ..
+            } => {
+                let min_x = start.x.min(end.x);
+                let max_x = start.x.max(end.x);
+                let min_y = start.y.min(end.y);
+                let max_y = start.y.max(end.y);
+                let _ = Rectangle::new(
+                    Point::new(min_x as i32, min_y as i32),
+                    Size::new((max_x - min_x + 1) as u32, (max_y - min_y + 1) as u32),
+                )
+                .into_styled(PrimitiveStyle::with_fill(to_binary(*color)))
+                .draw(display);
+            }
+            DrawCmd::DrawImage { .. } | DrawCmd::Clip { .. } | DrawCmd::Unclip => {}
+        }
+    }
+}
+
+fn to_binary(color: Color) -> BinaryColor {
+    match color {
+        Color::Black => BinaryColor::On,
+        Color::White => BinaryColor::Off,
+        Color::Gray(v) => {
+            if v < 128 {
+                BinaryColor::On
+            } else {
+                BinaryColor::Off
+            }
+        }
+        Color::Red | Color::Custom(_) => BinaryColor::On,
     }
 }

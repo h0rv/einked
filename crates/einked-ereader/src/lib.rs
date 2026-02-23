@@ -20,31 +20,63 @@ pub trait FrameSink {
     fn render_and_flush(&mut self, cmds: &[DrawCmd<'static>], hint: RefreshHint) -> bool;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayType {
+    Mono1Bpp,
+    Gray4,
+    TriColorBwr,
+    Custom(&'static str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceConfig {
+    pub name: &'static str,
+    pub screen: Rect,
+    pub display_type: DisplayType,
+    pub partial_refresh_limit: u8,
+}
+
+impl DeviceConfig {
+    pub const fn xteink_x4() -> Self {
+        Self {
+            name: "xteink-x4",
+            screen: Rect {
+                x: 0,
+                y: 0,
+                width: 480,
+                height: 800,
+            },
+            display_type: DisplayType::Mono1Bpp,
+            partial_refresh_limit: 8,
+        }
+    }
+}
+
 pub struct EreaderRuntime {
     stack: ActivityStack<DefaultTheme, 8>,
     pipeline: FramePipeline<512, 512>,
     theme: DefaultTheme,
     settings: NoopSettings,
     files: NoopFiles,
-    screen: Rect,
+    config: DeviceConfig,
 }
 
 impl EreaderRuntime {
-    pub fn new(screen: Rect) -> Self {
+    pub fn new(config: DeviceConfig) -> Self {
         let mut stack = ActivityStack::new();
         let theme = DefaultTheme;
         let mut settings = NoopSettings::default();
         let mut files = NoopFiles;
         let mut ctx = Context {
             theme: &theme,
-            screen,
+            screen: config.screen,
             settings: &mut settings,
             files: &mut files,
         };
         let _ = stack.push_root(Box::new(HomeActivity::new()), &mut ctx);
 
-        let mut pipeline = FramePipeline::new(8);
-        pipeline.set_viewport_width(screen.width);
+        let mut pipeline = FramePipeline::new(config.partial_refresh_limit);
+        pipeline.set_viewport_width(config.screen.width);
 
         Self {
             stack,
@@ -52,14 +84,18 @@ impl EreaderRuntime {
             theme,
             settings,
             files,
-            screen,
+            config,
         }
+    }
+
+    pub fn config(&self) -> DeviceConfig {
+        self.config
     }
 
     pub fn tick(&mut self, input: Option<InputEvent>, sink: &mut impl FrameSink) -> bool {
         let mut ctx = Context {
             theme: &self.theme,
-            screen: self.screen,
+            screen: self.config.screen,
             settings: &mut self.settings,
             files: &mut self.files,
         };
@@ -84,12 +120,7 @@ impl EreaderRuntime {
 
 impl Default for EreaderRuntime {
     fn default() -> Self {
-        Self::new(Rect {
-            x: 0,
-            y: 0,
-            width: 480,
-            height: 800,
-        })
+        Self::new(DeviceConfig::xteink_x4())
     }
 }
 
