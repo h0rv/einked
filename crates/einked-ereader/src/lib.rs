@@ -22,7 +22,10 @@ use std::io::Cursor;
 #[cfg(feature = "std")]
 use epub_stream::EpubBook;
 #[cfg(feature = "std")]
-use epub_stream_render::{DrawCommand as EpubDrawCommand, RenderEngine, RenderEngineOptions};
+use epub_stream_render::{
+    DrawCommand as EpubDrawCommand, HyphenationMode, JustificationStrategy, RenderConfig,
+    RenderEngine, RenderEngineOptions,
+};
 
 pub mod embedded_fonts;
 pub mod feed;
@@ -193,9 +196,16 @@ impl Ui<DefaultTheme> for RuntimeUi<'_> {
     }
 }
 
-#[derive(Default)]
 struct NoopSettings {
     slots: [u8; 32],
+}
+
+impl Default for NoopSettings {
+    fn default() -> Self {
+        Self {
+            slots: [u8::MAX; 32],
+        }
+    }
 }
 
 impl SettingsStore for NoopSettings {
@@ -276,7 +286,6 @@ enum ModalState {
         scroll: usize,
     },
     EpubReader {
-        title: String,
         path: String,
         chapter_idx: usize,
         chapter_count: usize,
@@ -297,6 +306,14 @@ enum ModalState {
         lines: Vec<String>,
         scroll: usize,
     },
+    FeedArticle {
+        source_idx: usize,
+        title: String,
+        entries: Vec<FeedEntry>,
+        item_idx: usize,
+        lines: Vec<String>,
+        scroll: usize,
+    },
 }
 
 #[derive(Clone)]
@@ -304,6 +321,15 @@ struct FeedEntry {
     title: String,
     url: Option<String>,
     summary: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct EpubLoadConfig {
+    font_size_idx: usize,
+    auto_sleep_idx: usize,
+    font_family_idx: usize,
+    min_pages: usize,
+    min_total_lines: usize,
 }
 
 struct HomeActivity {
@@ -315,6 +341,11 @@ struct HomeActivity {
     transfer_menu_idx: usize,
     files: Vec<String>,
     feed_sources: Vec<(String, String, FeedType)>,
+    font_size_idx: usize,
+    font_family_idx: usize,
+    auto_sleep_idx: usize,
+    refresh_idx: usize,
+    invert_colors_idx: usize,
     modal: ModalState,
 }
 
@@ -333,18 +364,27 @@ impl HomeActivity {
             transfer_menu_idx: 0,
             files: Vec::new(),
             feed_sources,
+            font_size_idx: 1,
+            font_family_idx: 0,
+            auto_sleep_idx: 1,
+            refresh_idx: 0,
+            invert_colors_idx: 0,
             modal: ModalState::None,
         }
     }
 
-    const SETTINGS_ITEMS: [&'static str; 5] = [
-        "Font Size: Medium",
-        "Font Family: Serif",
-        "Auto Sleep: 10m",
-        "Refresh: Never",
-        "Invert Colors: Off",
-    ];
+    const FONT_SIZE_OPTIONS: [&'static str; 3] = ["Small", "Medium", "Large"];
+    const FONT_FAMILY_OPTIONS: [&'static str; 3] = ["Serif", "Sans", "Mono"];
+    const AUTO_SLEEP_OPTIONS: [&'static str; 4] = ["5m", "10m", "15m", "Never"];
+    const REFRESH_OPTIONS: [&'static str; 3] = ["Never", "Every Page", "Every Chapter"];
+    const INVERT_COLORS_OPTIONS: [&'static str; 2] = ["Off", "On"];
+    const SETTINGS_ITEM_COUNT: usize = 5;
     const TRANSFER_ITEMS: [&'static str; 3] = ["Edit AP SSID", "Edit AP Password", "Start/Restart"];
+    const SETTING_KEY_FONT_SIZE: u8 = 1;
+    const SETTING_KEY_FONT_FAMILY: u8 = 2;
+    const SETTING_KEY_AUTO_SLEEP: u8 = 3;
+    const SETTING_KEY_REFRESH: u8 = 4;
+    const SETTING_KEY_INVERT_COLORS: u8 = 5;
 
     fn move_up(idx: &mut usize) {
         *idx = idx.saturating_sub(1);
@@ -353,6 +393,110 @@ impl HomeActivity {
     fn move_down(idx: &mut usize, len: usize) {
         if *idx + 1 < len {
             *idx += 1;
+        }
+    }
+
+    fn load_settings(&mut self, ctx: &mut Context<'_, DefaultTheme>) {
+        self.font_size_idx = Self::load_setting_idx(
+            ctx,
+            Self::SETTING_KEY_FONT_SIZE,
+            Self::FONT_SIZE_OPTIONS.len(),
+            self.font_size_idx,
+        );
+        self.font_family_idx = Self::load_setting_idx(
+            ctx,
+            Self::SETTING_KEY_FONT_FAMILY,
+            Self::FONT_FAMILY_OPTIONS.len(),
+            self.font_family_idx,
+        );
+        self.auto_sleep_idx = Self::load_setting_idx(
+            ctx,
+            Self::SETTING_KEY_AUTO_SLEEP,
+            Self::AUTO_SLEEP_OPTIONS.len(),
+            self.auto_sleep_idx,
+        );
+        self.refresh_idx = Self::load_setting_idx(
+            ctx,
+            Self::SETTING_KEY_REFRESH,
+            Self::REFRESH_OPTIONS.len(),
+            self.refresh_idx,
+        );
+        self.invert_colors_idx = Self::load_setting_idx(
+            ctx,
+            Self::SETTING_KEY_INVERT_COLORS,
+            Self::INVERT_COLORS_OPTIONS.len(),
+            self.invert_colors_idx,
+        );
+    }
+
+    fn load_setting_idx(
+        ctx: &mut Context<'_, DefaultTheme>,
+        key: u8,
+        len: usize,
+        default: usize,
+    ) -> usize {
+        let mut buf = [0u8; 1];
+        let loaded = ctx.settings.load_raw(key, &mut buf);
+        if loaded == 1 {
+            let idx = buf[0] as usize;
+            if idx < len {
+                return idx;
+            }
+        }
+        default
+    }
+
+    fn save_setting_idx(ctx: &mut Context<'_, DefaultTheme>, key: u8, idx: usize) {
+        ctx.settings.save_raw(key, &[idx as u8]);
+    }
+
+    fn settings_items(&self) -> Vec<String> {
+        vec![
+            format!("Font Size: {}", Self::FONT_SIZE_OPTIONS[self.font_size_idx]),
+            format!(
+                "Font Family: {}",
+                Self::FONT_FAMILY_OPTIONS[self.font_family_idx]
+            ),
+            format!(
+                "Auto Sleep: {}",
+                Self::AUTO_SLEEP_OPTIONS[self.auto_sleep_idx]
+            ),
+            format!("Refresh: {}", Self::REFRESH_OPTIONS[self.refresh_idx]),
+            format!(
+                "Invert Colors: {}",
+                Self::INVERT_COLORS_OPTIONS[self.invert_colors_idx]
+            ),
+        ]
+    }
+
+    fn cycle_setting(&mut self, ctx: &mut Context<'_, DefaultTheme>) {
+        match self.settings_idx {
+            0 => {
+                self.font_size_idx = (self.font_size_idx + 1) % Self::FONT_SIZE_OPTIONS.len();
+                Self::save_setting_idx(ctx, Self::SETTING_KEY_FONT_SIZE, self.font_size_idx);
+            }
+            1 => {
+                self.font_family_idx = (self.font_family_idx + 1) % Self::FONT_FAMILY_OPTIONS.len();
+                Self::save_setting_idx(ctx, Self::SETTING_KEY_FONT_FAMILY, self.font_family_idx);
+            }
+            2 => {
+                self.auto_sleep_idx = (self.auto_sleep_idx + 1) % Self::AUTO_SLEEP_OPTIONS.len();
+                Self::save_setting_idx(ctx, Self::SETTING_KEY_AUTO_SLEEP, self.auto_sleep_idx);
+            }
+            3 => {
+                self.refresh_idx = (self.refresh_idx + 1) % Self::REFRESH_OPTIONS.len();
+                Self::save_setting_idx(ctx, Self::SETTING_KEY_REFRESH, self.refresh_idx);
+            }
+            4 => {
+                self.invert_colors_idx =
+                    (self.invert_colors_idx + 1) % Self::INVERT_COLORS_OPTIONS.len();
+                Self::save_setting_idx(
+                    ctx,
+                    Self::SETTING_KEY_INVERT_COLORS,
+                    self.invert_colors_idx,
+                );
+            }
+            _ => {}
         }
     }
 
@@ -499,10 +643,99 @@ impl HomeActivity {
             || lower.starts_with("credits:")
     }
 
+    fn epub_line_height(&self) -> i16 {
+        match self.font_size_idx {
+            0 => 14,
+            1 => 16,
+            2 => 18,
+            _ => 16,
+        }
+    }
+
+    fn epub_max_chars(&self) -> usize {
+        match self.font_size_idx {
+            0 => 72,
+            1 => 64,
+            2 => 56,
+            _ => 64,
+        }
+    }
+
+    fn epub_rows_per_page(font_size_idx: usize) -> usize {
+        match font_size_idx {
+            0 => 52,
+            1 => 46,
+            2 => 40,
+            _ => 46,
+        }
+    }
+
+    fn epub_layout_margins(font_size_idx: usize) -> (i32, i32, i32, i32) {
+        let side = match font_size_idx {
+            0 => 8,
+            1 => 10,
+            2 => 12,
+            _ => 10,
+        };
+        (side, side, 10, 20)
+    }
+
+    fn epub_line_spacing_px(auto_sleep_idx: usize) -> (i32, i32) {
+        match auto_sleep_idx {
+            0 => (1, 6),
+            1 => (2, 8),
+            2 => (3, 10),
+            _ => (2, 8),
+        }
+    }
+
+    fn epub_base_font_px(font_size_idx: usize) -> f32 {
+        match font_size_idx {
+            0 => 16.0,
+            1 => 18.0,
+            2 => 20.0,
+            _ => 18.0,
+        }
+    }
+
+    fn epub_forced_font_family(font_family_idx: usize) -> &'static str {
+        match font_family_idx {
+            0 => "serif",
+            1 => "sans-serif",
+            2 => "monospace",
+            _ => "serif",
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn create_epub_engine(font_size_idx: usize, auto_sleep_idx: usize) -> RenderEngine {
+        let mut opts = RenderEngineOptions::for_display(480, 800);
+        let (margin_left, margin_right, margin_top, margin_bottom) =
+            Self::epub_layout_margins(font_size_idx);
+        let (line_gap_px, paragraph_gap_px) = Self::epub_line_spacing_px(auto_sleep_idx);
+        opts.layout.margin_left = margin_left;
+        opts.layout.margin_right = margin_right;
+        opts.layout.margin_top = margin_top;
+        opts.layout.margin_bottom = margin_bottom;
+        opts.layout.first_line_indent_px = 0;
+        opts.layout.line_gap_px = line_gap_px;
+        opts.layout.paragraph_gap_px = paragraph_gap_px;
+        opts.layout.typography.justification.enabled = false;
+        opts.layout.typography.justification.strategy = JustificationStrategy::AlignLeft;
+        opts.layout.typography.hyphenation.soft_hyphen_policy = HyphenationMode::Discretionary;
+        opts.prep.layout_hints.base_font_size_px = Self::epub_base_font_px(font_size_idx);
+        opts.prep.layout_hints.text_scale = 1.0;
+        opts.prep.layout_hints.min_line_height = 1.05;
+        opts.prep.layout_hints.max_line_height = 1.25;
+        opts.prep.style.hints = opts.prep.layout_hints;
+        RenderEngine::new(opts)
+    }
+
     #[cfg(feature = "std")]
     fn parse_epub_chapter_pages(
         bytes: &[u8],
         chapter_idx: usize,
+        cfg: EpubLoadConfig,
     ) -> Result<(usize, Vec<Vec<String>>), String> {
         let cursor = Cursor::new(bytes.to_vec());
         let mut book = match EpubBook::builder().from_reader(cursor) {
@@ -520,31 +753,41 @@ impl HomeActivity {
             return Err("Chapter out of range.".to_string());
         }
 
-        let engine = RenderEngine::new(RenderEngineOptions::for_display(448, 700));
-        let pages = match engine.prepare_chapter(&mut book, chapter_idx) {
+        let engine = Self::create_epub_engine(cfg.font_size_idx, cfg.auto_sleep_idx);
+        let config = RenderConfig::default()
+            .with_forced_font_family(Self::epub_forced_font_family(cfg.font_family_idx));
+        let pages = match engine.prepare_chapter_with_config_collect(&mut book, chapter_idx, config)
+        {
             Ok(pages) => pages,
             Err(err) => {
                 return Err(format!("EPUB render failed: {}", err));
             }
         };
-        let mut out_pages: Vec<Vec<String>> = Vec::new();
+        let mut lines_all: Vec<String> = Vec::new();
         for page in pages.iter() {
-            let mut page_lines = Vec::new();
             for cmd in &page.content_commands {
                 if let EpubDrawCommand::Text(text) = cmd {
                     let trimmed = text.text.trim();
                     if trimmed.is_empty() || Self::is_epub_boilerplate_line(trimmed) {
                         continue;
                     }
-                    Self::wrap_single_line(trimmed, 56, &mut page_lines);
+                    let max_chars = match cfg.font_size_idx {
+                        0 => 72,
+                        1 => 64,
+                        2 => 56,
+                        _ => 64,
+                    };
+                    Self::wrap_single_line(trimmed, max_chars, &mut lines_all);
                 }
             }
-            if !page_lines.is_empty() {
-                out_pages.push(page_lines);
-            }
         }
-        if out_pages.is_empty() {
-            return Err("No readable text produced by renderer.".to_string());
+        let mut out_pages: Vec<Vec<String>> = Vec::new();
+        let rows_per_page = Self::epub_rows_per_page(cfg.font_size_idx).max(1);
+        let mut cursor = 0usize;
+        while cursor < lines_all.len() {
+            let end = (cursor + rows_per_page).min(lines_all.len());
+            out_pages.push(lines_all[cursor..end].to_vec());
+            cursor = end;
         }
         Ok((chapter_count, out_pages))
     }
@@ -553,6 +796,7 @@ impl HomeActivity {
     fn parse_epub_chapter_pages(
         _bytes: &[u8],
         _chapter_idx: usize,
+        _cfg: EpubLoadConfig,
     ) -> Result<(usize, Vec<Vec<String>>), String> {
         Err("EPUB parsing requires std feature.".to_string())
     }
@@ -568,6 +812,7 @@ impl HomeActivity {
     fn load_epub_chapter(
         path: &str,
         chapter_idx: usize,
+        cfg: EpubLoadConfig,
         ctx: &mut Context<'_, DefaultTheme>,
     ) -> Result<(usize, Vec<Vec<String>>), String> {
         let buf_len = if cfg!(target_os = "espidf") {
@@ -578,25 +823,59 @@ impl HomeActivity {
         let mut buf = vec![0u8; buf_len];
         let bytes = Self::read_file_bytes(path, ctx, &mut buf)
             .map_err(|_| "Failed to read EPUB file.".to_string())?;
-        Self::parse_epub_chapter_pages(bytes, chapter_idx)
+        Self::parse_epub_chapter_pages(bytes, chapter_idx, cfg)
+    }
+
+    fn load_epub_chapter_in_direction(
+        path: &str,
+        chapter_idx: usize,
+        step: isize,
+        cfg: EpubLoadConfig,
+        ctx: &mut Context<'_, DefaultTheme>,
+    ) -> Option<(usize, usize, Vec<Vec<String>>)> {
+        let (chapter_count, initial_pages) =
+            Self::load_epub_chapter(path, chapter_idx, cfg, ctx).ok()?;
+        let initial_total_lines = initial_pages.iter().map(|page| page.len()).sum::<usize>();
+        if initial_pages.len() >= cfg.min_pages.max(1) && initial_total_lines >= cfg.min_total_lines
+        {
+            return Some((chapter_count, chapter_idx, initial_pages));
+        }
+
+        let mut idx = chapter_idx as isize + step;
+        while idx >= 0 && (idx as usize) < chapter_count {
+            if let Ok((count, pages)) = Self::load_epub_chapter(path, idx as usize, cfg, ctx) {
+                let total_lines = pages.iter().map(|page| page.len()).sum::<usize>();
+                if pages.len() >= cfg.min_pages.max(1) && total_lines >= cfg.min_total_lines {
+                    return Some((count, idx as usize, pages));
+                }
+            }
+            idx += step;
+        }
+        None
     }
 
     fn open_epub_in_reader(&mut self, path: &str, ctx: &mut Context<'_, DefaultTheme>) {
-        match Self::load_epub_chapter(path, 0, ctx) {
-            Ok((chapter_count, pages)) => {
+        let cfg = EpubLoadConfig {
+            font_size_idx: self.font_size_idx,
+            auto_sleep_idx: self.auto_sleep_idx,
+            font_family_idx: self.font_family_idx,
+            min_pages: 2,
+            min_total_lines: Self::epub_rows_per_page(self.font_size_idx),
+        };
+        match Self::load_epub_chapter_in_direction(path, 0, 1, cfg, ctx) {
+            Some((chapter_count, chapter_idx, pages)) => {
                 self.modal = ModalState::EpubReader {
-                    title: path.to_string(),
                     path: path.to_string(),
-                    chapter_idx: 0,
+                    chapter_idx,
                     chapter_count,
                     pages,
                     page_idx: 0,
                 };
             }
-            Err(message) => {
+            None => {
                 self.modal = ModalState::Reader {
                     title: path.to_string(),
-                    lines: vec![message],
+                    lines: vec!["No readable text produced by renderer.".to_string()],
                     scroll: 0,
                 };
             }
@@ -648,12 +927,13 @@ impl HomeActivity {
     ) {
         for (idx, item) in items.iter().enumerate() {
             let prefix = if idx == selected { "> " } else { "  " };
+            let row = Self::truncate_single_line(item, 50);
             ui_ctx.draw_text_at(
                 Point {
                     x: 18,
                     y: y_start + (idx as i16 * 22),
                 },
-                &format!("{}{}", prefix, item),
+                &format!("{}{}", prefix, row),
             );
         }
     }
@@ -666,14 +946,31 @@ impl HomeActivity {
     ) {
         for (idx, item) in items.iter().enumerate() {
             let prefix = if idx == selected { "> " } else { "  " };
+            let row = Self::truncate_single_line(&item.title, 50);
             ui_ctx.draw_text_at(
                 Point {
                     x: 18,
                     y: y_start + (idx as i16 * 22),
                 },
-                &format!("{}{}", prefix, item.title),
+                &format!("{}{}", prefix, row),
             );
         }
+    }
+
+    fn truncate_single_line(text: &str, max_chars: usize) -> String {
+        let count = text.chars().count();
+        if count <= max_chars {
+            return text.to_string();
+        }
+        if max_chars <= 3 {
+            return "...".to_string();
+        }
+        let mut out = String::new();
+        for ch in text.chars().take(max_chars - 3) {
+            out.push(ch);
+        }
+        out.push_str("...");
+        out
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -716,6 +1013,37 @@ impl HomeActivity {
         None
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn fetch_article_lines(url: &str) -> Result<Vec<String>, String> {
+        let reader_url = get_reader_url(url);
+        let response = ureq::get(&reader_url)
+            .call()
+            .map_err(|_| "Failed to fetch article.".to_string())?;
+        let mut body = response.into_body();
+        let bytes = body
+            .read_to_vec()
+            .map_err(|_| "Failed reading article body.".to_string())?;
+        let text = String::from_utf8_lossy(&bytes);
+        let mut lines = Vec::new();
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                lines.push(String::new());
+                continue;
+            }
+            Self::wrap_single_line(trimmed, 56, &mut lines);
+        }
+        if lines.is_empty() {
+            return Err("Article had no readable text.".to_string());
+        }
+        Ok(lines)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    fn fetch_article_lines(_url: &str) -> Result<Vec<String>, String> {
+        Err("Article rendering requires host networking.".to_string())
+    }
+
     fn draw_reader_lines(ui_ctx: &mut dyn Ui<DefaultTheme>, lines: &[String], scroll: usize) {
         let start_y = 70i16;
         let visible = 30usize;
@@ -729,6 +1057,48 @@ impl HomeActivity {
                 line,
             );
         }
+    }
+
+    fn draw_epub_lines(
+        &self,
+        ui_ctx: &mut dyn Ui<DefaultTheme>,
+        lines: &[String],
+        page_idx: usize,
+        total_pages: usize,
+        chapter_idx: usize,
+        chapter_count: usize,
+    ) {
+        let line_height = self.epub_line_height();
+        let start_y = 12i16;
+        let footer_y = 794i16;
+        let max_rows = ((footer_y - start_y) / line_height).max(1) as usize;
+        let max_chars = self.epub_max_chars();
+        let mut cursor = 0usize;
+        let mut row = 0usize;
+
+        while row < max_rows && cursor < lines.len() {
+            let line = Self::truncate_single_line(&lines[cursor], max_chars);
+            ui_ctx.draw_text_at(
+                Point {
+                    x: 8,
+                    y: start_y + (row as i16 * line_height),
+                },
+                &line,
+            );
+            row += 1;
+            cursor += 1;
+        }
+
+        ui_ctx.draw_text_at(
+            Point { x: 8, y: footer_y },
+            &format!(
+                "ch {}/{}  p {}/{}",
+                chapter_idx + 1,
+                chapter_count.max(1),
+                page_idx + 1,
+                total_pages.max(1)
+            ),
+        );
     }
 
     fn render_library(&self, ui_ctx: &mut dyn Ui<DefaultTheme>) {
@@ -777,10 +1147,7 @@ impl HomeActivity {
     }
 
     fn render_settings(&self, ui_ctx: &mut dyn Ui<DefaultTheme>) {
-        let items: Vec<String> = Self::SETTINGS_ITEMS
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
+        let items = self.settings_items();
         ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "Settings");
         ui_ctx.draw_line(
             Point { x: 16, y: 34 },
@@ -832,34 +1199,27 @@ impl HomeActivity {
     fn render_epub_reader(
         &self,
         ui_ctx: &mut dyn Ui<DefaultTheme>,
-        title: &str,
         chapter_idx: usize,
         chapter_count: usize,
         pages: &[Vec<String>],
         page_idx: usize,
     ) {
-        ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "Reader");
-        ui_ctx.draw_line(
-            Point { x: 16, y: 34 },
-            Point { x: 464, y: 34 },
-            Color::Black,
-            1,
-        );
-        ui_ctx.draw_text_at(Point { x: 16, y: 54 }, title);
         if let Some(lines) = pages.get(page_idx) {
-            Self::draw_reader_lines(ui_ctx, lines, 0);
+            self.draw_epub_lines(
+                ui_ctx,
+                lines,
+                page_idx,
+                pages.len(),
+                chapter_idx,
+                chapter_count,
+            );
         }
-        let footer = format!(
-            "ch {}/{}  p {}/{}",
-            chapter_idx + 1,
-            chapter_count.max(1),
-            page_idx + 1,
-            pages.len().max(1)
-        );
-        ui_ctx.draw_text_at(Point { x: 300, y: 792 }, &footer);
     }
 
     fn render_bottom_bar(&self, ui_ctx: &mut dyn Ui<DefaultTheme>) {
+        if matches!(self.modal, ModalState::EpubReader { .. }) {
+            return;
+        }
         ui_ctx.draw_line(
             Point { x: 0, y: 772 },
             Point { x: 479, y: 772 },
@@ -869,26 +1229,26 @@ impl HomeActivity {
         let left_hint = match self.modal {
             ModalState::Transfer => "Back: Exit transfer",
             ModalState::Reader { .. } => "Back: Close",
-            ModalState::EpubReader { .. } => "Back Close  L/R Page  Vol Ch",
             ModalState::FeedEntries { .. } => "Back: Sources",
             ModalState::FeedItem { .. } => "Back: Entries",
+            ModalState::FeedArticle { .. } => "Back: Entry",
             ModalState::None => match self.tab {
                 MainTab::Library => "Back: Refresh library",
                 MainTab::Files => "Back: Up",
                 MainTab::Feed => "Back: Sources",
                 MainTab::Settings => "Back: No-op",
             },
+            ModalState::EpubReader { .. } => "",
         };
         ui_ctx.draw_text_at(Point { x: 14, y: 792 }, left_hint);
-        if !matches!(self.modal, ModalState::EpubReader { .. }) {
-            ui_ctx.draw_text_at(Point { x: 210, y: 792 }, self.tab.dot_label());
-            ui_ctx.draw_text_at(Point { x: 432, y: 792 }, "100%");
-        }
+        ui_ctx.draw_text_at(Point { x: 210, y: 792 }, self.tab.dot_label());
+        ui_ctx.draw_text_at(Point { x: 432, y: 792 }, "100%");
     }
 }
 
 impl Activity<DefaultTheme> for HomeActivity {
     fn on_enter(&mut self, ctx: &mut Context<'_, DefaultTheme>) {
+        self.load_settings(ctx);
         self.refresh_files(ctx);
     }
 
@@ -897,6 +1257,13 @@ impl Activity<DefaultTheme> for HomeActivity {
         event: InputEvent,
         ctx: &mut Context<'_, DefaultTheme>,
     ) -> Transition<DefaultTheme> {
+        let epub_nav_cfg = EpubLoadConfig {
+            font_size_idx: self.font_size_idx,
+            auto_sleep_idx: self.auto_sleep_idx,
+            font_family_idx: self.font_family_idx,
+            min_pages: 1,
+            min_total_lines: 1,
+        };
         match &mut self.modal {
             ModalState::Transfer => {
                 return match event {
@@ -956,11 +1323,17 @@ impl Activity<DefaultTheme> for HomeActivity {
                         }
                         if *chapter_idx > 0 {
                             let next_chapter = *chapter_idx - 1;
-                            if let Ok((next_count, next_pages)) =
-                                Self::load_epub_chapter(path, next_chapter, ctx)
+                            if let Some((next_count, resolved_chapter, next_pages)) =
+                                Self::load_epub_chapter_in_direction(
+                                    path,
+                                    next_chapter,
+                                    -1,
+                                    epub_nav_cfg,
+                                    ctx,
+                                )
                             {
                                 *chapter_count = next_count;
-                                *chapter_idx = next_chapter;
+                                *chapter_idx = resolved_chapter;
                                 *page_idx = next_pages.len().saturating_sub(1);
                                 *pages = next_pages;
                             }
@@ -974,11 +1347,17 @@ impl Activity<DefaultTheme> for HomeActivity {
                         }
                         if *chapter_idx + 1 < *chapter_count {
                             let next_chapter = *chapter_idx + 1;
-                            if let Ok((next_count, next_pages)) =
-                                Self::load_epub_chapter(path, next_chapter, ctx)
+                            if let Some((next_count, resolved_chapter, next_pages)) =
+                                Self::load_epub_chapter_in_direction(
+                                    path,
+                                    next_chapter,
+                                    1,
+                                    epub_nav_cfg,
+                                    ctx,
+                                )
                             {
                                 *chapter_count = next_count;
-                                *chapter_idx = next_chapter;
+                                *chapter_idx = resolved_chapter;
                                 *page_idx = 0;
                                 *pages = next_pages;
                             }
@@ -988,11 +1367,17 @@ impl Activity<DefaultTheme> for HomeActivity {
                     InputEvent::Press(Button::Aux1) => {
                         if *chapter_idx > 0 {
                             let next_chapter = *chapter_idx - 1;
-                            if let Ok((next_count, next_pages)) =
-                                Self::load_epub_chapter(path, next_chapter, ctx)
+                            if let Some((next_count, resolved_chapter, next_pages)) =
+                                Self::load_epub_chapter_in_direction(
+                                    path,
+                                    next_chapter,
+                                    -1,
+                                    epub_nav_cfg,
+                                    ctx,
+                                )
                             {
                                 *chapter_count = next_count;
-                                *chapter_idx = next_chapter;
+                                *chapter_idx = resolved_chapter;
                                 *page_idx = 0;
                                 *pages = next_pages;
                             }
@@ -1002,11 +1387,17 @@ impl Activity<DefaultTheme> for HomeActivity {
                     InputEvent::Press(Button::Aux2) => {
                         if *chapter_idx + 1 < *chapter_count {
                             let next_chapter = *chapter_idx + 1;
-                            if let Ok((next_count, next_pages)) =
-                                Self::load_epub_chapter(path, next_chapter, ctx)
+                            if let Some((next_count, resolved_chapter, next_pages)) =
+                                Self::load_epub_chapter_in_direction(
+                                    path,
+                                    next_chapter,
+                                    1,
+                                    epub_nav_cfg,
+                                    ctx,
+                                )
                             {
                                 *chapter_count = next_count;
-                                *chapter_idx = next_chapter;
+                                *chapter_idx = resolved_chapter;
                                 *page_idx = 0;
                                 *pages = next_pages;
                             }
@@ -1069,6 +1460,7 @@ impl Activity<DefaultTheme> for HomeActivity {
             }
             ModalState::FeedItem {
                 source_idx,
+                title,
                 entries,
                 item_idx,
                 scroll,
@@ -1082,6 +1474,72 @@ impl Activity<DefaultTheme> for HomeActivity {
                             title: self.feed_sources[*source_idx].0.clone(),
                             entries: entries.clone(),
                             selected_idx: *item_idx,
+                        };
+                        Transition::Stay
+                    }
+                    InputEvent::Press(Button::Confirm) => {
+                        if let Some(url) = entries.get(*item_idx).and_then(|e| e.url.clone()) {
+                            let article_lines = match Self::fetch_article_lines(&url) {
+                                Ok(lines) => lines,
+                                Err(message) => vec![message, format!("URL: {}", url)],
+                            };
+                            self.modal = ModalState::FeedArticle {
+                                source_idx: *source_idx,
+                                title: title.clone(),
+                                entries: entries.clone(),
+                                item_idx: *item_idx,
+                                lines: article_lines,
+                                scroll: 0,
+                            };
+                        } else {
+                            lines.push(String::new());
+                            lines.push("No article URL available for this entry.".to_string());
+                        }
+                        Transition::Stay
+                    }
+                    InputEvent::Press(Button::Up) | InputEvent::Press(Button::Aux1) => {
+                        Self::move_up(scroll);
+                        Transition::Stay
+                    }
+                    InputEvent::Press(Button::Down) | InputEvent::Press(Button::Aux2) => {
+                        Self::move_down(scroll, lines.len());
+                        Transition::Stay
+                    }
+                    _ => Transition::Stay,
+                };
+            }
+            ModalState::FeedArticle {
+                source_idx,
+                title,
+                entries,
+                item_idx,
+                lines,
+                scroll,
+            } => {
+                return match event {
+                    InputEvent::Press(Button::Back) => {
+                        let mut item_lines = Vec::new();
+                        if let Some(item) = entries.get(*item_idx).cloned() {
+                            item_lines.push(format!("Entry: {}", item.title));
+                            if let Some(summary) = item.summary {
+                                for line in summary.lines().take(24) {
+                                    item_lines.push(line.to_string());
+                                }
+                            }
+                            if let Some(url) = item.url {
+                                item_lines.push(String::new());
+                                item_lines.push(format!("URL: {}", url));
+                            }
+                            item_lines.push(String::new());
+                            item_lines.push("Back returns to entries.".to_string());
+                        }
+                        self.modal = ModalState::FeedItem {
+                            source_idx: *source_idx,
+                            title: title.clone(),
+                            entries: entries.clone(),
+                            item_idx: *item_idx,
+                            lines: Self::wrap_reader_lines(item_lines),
+                            scroll: 0,
                         };
                         Transition::Stay
                     }
@@ -1124,7 +1582,7 @@ impl Activity<DefaultTheme> for HomeActivity {
                     MainTab::Files => Self::move_down(&mut self.files_idx, self.files.len()),
                     MainTab::Feed => Self::move_down(&mut self.feed_idx, self.feed_sources.len()),
                     MainTab::Settings => {
-                        Self::move_down(&mut self.settings_idx, Self::SETTINGS_ITEMS.len())
+                        Self::move_down(&mut self.settings_idx, Self::SETTINGS_ITEM_COUNT)
                     }
                 }
                 Transition::Stay
@@ -1166,7 +1624,10 @@ impl Activity<DefaultTheme> for HomeActivity {
                     };
                     Transition::Stay
                 }
-                MainTab::Settings => Transition::Stay,
+                MainTab::Settings => {
+                    self.cycle_setting(ctx);
+                    Transition::Stay
+                }
             },
             _ => Transition::Stay,
         }
@@ -1191,20 +1652,12 @@ impl Activity<DefaultTheme> for HomeActivity {
                 scroll,
             } => self.render_reader(ui_ctx, title, lines, *scroll),
             ModalState::EpubReader {
-                title,
                 chapter_idx,
                 chapter_count,
                 pages,
                 page_idx,
                 ..
-            } => self.render_epub_reader(
-                ui_ctx,
-                title,
-                *chapter_idx,
-                *chapter_count,
-                pages,
-                *page_idx,
-            ),
+            } => self.render_epub_reader(ui_ctx, *chapter_idx, *chapter_count, pages, *page_idx),
             ModalState::FeedEntries {
                 title,
                 entries,
@@ -1222,6 +1675,12 @@ impl Activity<DefaultTheme> for HomeActivity {
                 Self::draw_feed_entries(ui_ctx, 88, *selected_idx, entries);
             }
             ModalState::FeedItem {
+                title,
+                lines,
+                scroll,
+                ..
+            } => self.render_reader(ui_ctx, title, lines, *scroll),
+            ModalState::FeedArticle {
                 title,
                 lines,
                 scroll,
@@ -1289,7 +1748,7 @@ mod tests {
     }
 
     #[test]
-    fn confirm_on_library_and_files_opens_detail_modal() {
+    fn confirm_on_empty_library_opens_transfer_modal() {
         let mut act = HomeActivity::new();
         let mut settings = NoopSettings::default();
         let mut files = NoopFiles;
@@ -1297,13 +1756,12 @@ mod tests {
         act.on_enter(&mut ctx);
 
         let _ = act.on_input(InputEvent::Press(Button::Confirm), &mut ctx);
-        assert!(matches!(act.modal, ModalState::Reader { .. }));
+        assert!(matches!(act.modal, ModalState::Transfer));
         let _ = act.on_input(InputEvent::Press(Button::Back), &mut ctx);
         assert!(matches!(act.modal, ModalState::None));
 
         let _ = act.on_input(InputEvent::Press(Button::Right), &mut ctx);
-        let _ = act.on_input(InputEvent::Press(Button::Down), &mut ctx);
         let _ = act.on_input(InputEvent::Press(Button::Confirm), &mut ctx);
-        assert!(matches!(act.modal, ModalState::Reader { .. }));
+        assert!(matches!(act.modal, ModalState::None));
     }
 }

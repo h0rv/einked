@@ -23,5 +23,10 @@ test:
     RUSTC_WRAPPER= cargo test -p einked --all-features
     RUSTC_WRAPPER= cargo test -p einked-macros
 
+# Run deterministic UI regression audit with artifact snapshots.
+# Writes PNG + text captures under target/ui-audit/.
+ui-audit:
+    RUSTC_WRAPPER= cargo test --manifest-path crates/einked-ui-harness/Cargo.toml --test ui_regression -- --nocapture
+
 doc:
     RUSTC_WRAPPER= RUSTDOCFLAGS='-D warnings' cargo doc -p einked -p einked-macros --all-features --no-deps

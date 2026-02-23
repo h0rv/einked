@@ -31,8 +31,10 @@ impl FrameSink for DesktopSink<'_> {
 fn main() {
     let config = DeviceConfig::xteink_x4();
     let output_settings = OutputSettingsBuilder::new().scale(1).build();
-    let mut display: SimulatorDisplay<BinaryColor> =
-        SimulatorDisplay::new(Size::new(config.screen.width as u32, config.screen.height as u32));
+    let mut display: SimulatorDisplay<BinaryColor> = SimulatorDisplay::new(Size::new(
+        config.screen.width as u32,
+        config.screen.height as u32,
+    ));
     let mut window = Window::new("einked-ereader (desktop)", &output_settings);
     let mut runtime = EreaderRuntime::with_backends(
         config,

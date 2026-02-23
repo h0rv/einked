@@ -1,0 +1,14 @@
+[package]
+name = "einked-ui-harness"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+einked = { path = "../..", features = ["std"] }
+einked-ereader = { path = "../einked-ereader", features = ["std"] }
+
+[dev-dependencies]
+font8x8 = "0.3"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[workspace]
