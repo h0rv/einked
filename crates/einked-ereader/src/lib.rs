@@ -72,7 +72,9 @@ impl EreaderRuntime {
             if !alive {
                 return false;
             }
-            Header::new("einked").with_right_text("ereader").render_to_runtime(&mut ui.runtime);
+            Header::new("einked")
+                .with_right_text("ereader")
+                .render_to_runtime(&mut ui.runtime);
             hint = ui.runtime.take_refresh_hint();
         }
 
