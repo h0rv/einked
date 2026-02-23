@@ -215,6 +215,7 @@ impl FileStore for NoopFiles {
 enum MainTab {
     Library,
     Files,
+    Feed,
     Settings,
 }
 
@@ -222,7 +223,8 @@ impl MainTab {
     fn next(self) -> Self {
         match self {
             Self::Library => Self::Files,
-            Self::Files => Self::Settings,
+            Self::Files => Self::Feed,
+            Self::Feed => Self::Settings,
             Self::Settings => Self::Library,
         }
     }
@@ -231,15 +233,17 @@ impl MainTab {
         match self {
             Self::Library => Self::Settings,
             Self::Files => Self::Library,
-            Self::Settings => Self::Files,
+            Self::Feed => Self::Files,
+            Self::Settings => Self::Feed,
         }
     }
 
     fn dot_label(self) -> &'static str {
         match self {
-            Self::Library => "O o o",
-            Self::Files => "o O o",
-            Self::Settings => "o o O",
+            Self::Library => "O o o o",
+            Self::Files => "o O o o",
+            Self::Feed => "o o O o",
+            Self::Settings => "o o o O",
         }
     }
 }
@@ -248,6 +252,7 @@ struct HomeActivity {
     tab: MainTab,
     library_idx: usize,
     files_idx: usize,
+    feed_idx: usize,
     settings_idx: usize,
     transfer_open: bool,
     transfer_menu_idx: usize,
@@ -259,6 +264,7 @@ impl HomeActivity {
             tab: MainTab::Library,
             library_idx: 0,
             files_idx: 0,
+            feed_idx: 0,
             settings_idx: 0,
             transfer_open: false,
             transfer_menu_idx: 0,
@@ -273,6 +279,14 @@ impl HomeActivity {
         "File Transfer",
     ];
     const FILES_ITEMS: [&'static str; 4] = ["books/", "downloads/", "notes/", "samples/"];
+    const FEED_ITEMS: [&'static str; 6] = [
+        "Project Gutenberg (OPDS)",
+        "Standard Ebooks (OPDS)",
+        "Feedbooks (OPDS)",
+        "Hacker News (RSS)",
+        "Hacker News Frontpage (RSS)",
+        "Longform (RSS)",
+    ];
     const SETTINGS_ITEMS: [&'static str; 5] = [
         "Font Size: Medium",
         "Font Family: Serif",
@@ -338,6 +352,17 @@ impl HomeActivity {
         Self::draw_list(ui_ctx, 66, self.settings_idx, &Self::SETTINGS_ITEMS);
     }
 
+    fn render_feed(&self, ui_ctx: &mut dyn Ui<DefaultTheme>) {
+        ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "Feed");
+        ui_ctx.draw_line(
+            Point { x: 16, y: 34 },
+            Point { x: 464, y: 34 },
+            Color::Black,
+            1,
+        );
+        Self::draw_list(ui_ctx, 66, self.feed_idx, &Self::FEED_ITEMS);
+    }
+
     fn render_transfer_screen(&self, ui_ctx: &mut dyn Ui<DefaultTheme>) {
         ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "File Transfer");
         ui_ctx.draw_line(
@@ -367,6 +392,7 @@ impl HomeActivity {
             match self.tab {
                 MainTab::Library => "Back: Refresh library",
                 MainTab::Files => "Back: Up",
+                MainTab::Feed => "Back: Sources",
                 MainTab::Settings => "Back: No-op",
             }
         };
@@ -413,6 +439,7 @@ impl Activity<DefaultTheme> for HomeActivity {
                 match self.tab {
                     MainTab::Library => Self::move_up(&mut self.library_idx),
                     MainTab::Files => Self::move_up(&mut self.files_idx),
+                    MainTab::Feed => Self::move_up(&mut self.feed_idx),
                     MainTab::Settings => Self::move_up(&mut self.settings_idx),
                 }
                 Transition::Stay
@@ -423,6 +450,7 @@ impl Activity<DefaultTheme> for HomeActivity {
                         Self::move_down(&mut self.library_idx, Self::LIBRARY_ITEMS.len())
                     }
                     MainTab::Files => Self::move_down(&mut self.files_idx, Self::FILES_ITEMS.len()),
+                    MainTab::Feed => Self::move_down(&mut self.feed_idx, Self::FEED_ITEMS.len()),
                     MainTab::Settings => {
                         Self::move_down(&mut self.settings_idx, Self::SETTINGS_ITEMS.len())
                     }
@@ -458,6 +486,7 @@ impl Activity<DefaultTheme> for HomeActivity {
             match self.tab {
                 MainTab::Library => self.render_library(ui_ctx),
                 MainTab::Files => self.render_files(ui_ctx),
+                MainTab::Feed => self.render_feed(ui_ctx),
                 MainTab::Settings => self.render_settings(ui_ctx),
             }
         }
