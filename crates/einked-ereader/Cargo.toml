@@ -5,7 +5,13 @@ edition = "2024"
 
 [features]
 default = ["std"]
-std = ["einked/std"]
+std = ["einked/std", "dep:epub-stream", "dep:epub-stream-render"]
 
 [dependencies]
 einked = { path = "../..", features = ["alloc"] }
+epub-stream = { path = "../../../epub-stream", package = "epub-stream", optional = true }
+epub-stream-render = { path = "../../../epub-stream/crates/epub-stream-render", package = "epub-stream-render", optional = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
+feed-rs = "2.3.1"
+ureq = { version = "3.2", default-features = true }

@@ -16,6 +16,13 @@ use einked::refresh::RefreshHint;
 use einked::render_ir::DrawCmd;
 use einked::storage::{FileStore, FileStoreError, SettingsStore};
 use einked::ui::runtime::UiRuntime;
+#[cfg(feature = "std")]
+use std::io::Cursor;
+
+#[cfg(feature = "std")]
+use epub_stream::EpubBook;
+#[cfg(feature = "std")]
+use epub_stream_render::{DrawCommand as EpubDrawCommand, RenderEngine, RenderEngineOptions};
 
 pub mod embedded_fonts;
 pub mod feed;
@@ -271,17 +278,24 @@ enum ModalState {
     FeedEntries {
         source_idx: usize,
         title: String,
-        entries: Vec<String>,
+        entries: Vec<FeedEntry>,
         selected_idx: usize,
     },
     FeedItem {
         source_idx: usize,
         title: String,
-        entries: Vec<String>,
+        entries: Vec<FeedEntry>,
         item_idx: usize,
         lines: Vec<String>,
         scroll: usize,
     },
+}
+
+#[derive(Clone)]
+struct FeedEntry {
+    title: String,
+    url: Option<String>,
+    summary: Option<String>,
 }
 
 struct HomeActivity {
@@ -380,16 +394,11 @@ impl HomeActivity {
         path: &str,
         ctx: &mut Context<'_, DefaultTheme>,
     ) -> Result<Vec<String>, FileStoreError> {
-        let mut buf = vec![0u8; 64 * 1024];
+        let mut buf = vec![0u8; 512 * 1024];
         let bytes = ctx.files.read(path, &mut buf)?;
         let lower = path.to_ascii_lowercase();
         if lower.ends_with(".epub") || lower.ends_with(".epu") {
-            let mut lines = Vec::new();
-            lines.push(format!("EPUB: {}", path));
-            lines.push(format!("Size: {} bytes", bytes.len()));
-            lines.push("EPUB parser hookup in progress.".to_string());
-            lines.push("This file opened successfully.".to_string());
-            Ok(lines)
+            Ok(self.read_epub_lines(path, bytes))
         } else {
             let text = String::from_utf8_lossy(bytes);
             let mut lines = Vec::new();
@@ -401,6 +410,75 @@ impl HomeActivity {
             }
             Ok(lines)
         }
+    }
+
+    #[cfg(feature = "std")]
+    fn read_epub_lines(&self, path: &str, bytes: &[u8]) -> Vec<String> {
+        let mut lines = Vec::new();
+        let cursor = Cursor::new(bytes.to_vec());
+        let mut book = match EpubBook::builder().from_reader(cursor) {
+            Ok(book) => book,
+            Err(err) => {
+                lines.push(format!("EPUB: {}", path));
+                lines.push(format!("Failed to parse EPUB: {}", err));
+                return lines;
+            }
+        };
+
+        lines.push(format!("Title: {}", book.title()));
+        lines.push(format!("Author: {}", book.author()));
+        lines.push(format!("Chapters: {}", book.chapter_count()));
+        lines.push(String::new());
+
+        let mut rendered = false;
+        if book.chapter_count() > 0 {
+            let engine = RenderEngine::new(RenderEngineOptions::for_display(448, 700));
+            if let Ok(pages) = engine.prepare_chapter(&mut book, 0) {
+                if let Some(first_page) = pages.first() {
+                    lines.push("Chapter 1 (rendered page):".to_string());
+                    for cmd in &first_page.content_commands {
+                        if let EpubDrawCommand::Text(text) = cmd {
+                            let trimmed = text.text.trim();
+                            if !trimmed.is_empty() {
+                                lines.push(trimmed.to_string());
+                            }
+                            if lines.len() >= 120 {
+                                break;
+                            }
+                        }
+                    }
+                    rendered = true;
+                }
+            }
+        }
+
+        if !rendered && book.chapter_count() > 0 {
+            match book.chapter_text_with_limit(0, 48 * 1024) {
+                Ok(chapter) => {
+                    lines.push("Chapter 1:".to_string());
+                    for line in chapter.lines().take(100) {
+                        lines.push(line.to_string());
+                    }
+                }
+                Err(err) => {
+                    lines.push(format!("Failed to read chapter text: {}", err));
+                }
+            }
+        }
+
+        if lines.len() <= 4 {
+            lines.push("(No readable chapter text found)".to_string());
+        }
+        lines
+    }
+
+    #[cfg(not(feature = "std"))]
+    fn read_epub_lines(&self, path: &str, bytes: &[u8]) -> Vec<String> {
+        vec![
+            format!("EPUB: {}", path),
+            format!("Size: {} bytes", bytes.len()),
+            "EPUB parsing requires std feature.".to_string(),
+        ]
     }
 
     fn open_file_in_reader(&mut self, path: &str, ctx: &mut Context<'_, DefaultTheme>) {
@@ -425,24 +503,56 @@ impl HomeActivity {
         }
     }
 
-    fn feed_entries_for_source(&self, source_idx: usize) -> Vec<String> {
+    fn feed_entries_for_source(&self, source_idx: usize) -> Vec<FeedEntry> {
+        if let Some(entries) = self.fetch_live_feed_entries(source_idx) {
+            return entries;
+        }
+
         let mut entries = Vec::new();
-        if let Some((name, _, ty)) = self.feed_sources.get(source_idx) {
+        if let Some((name, url, ty)) = self.feed_sources.get(source_idx) {
             match ty {
                 FeedType::Opds => {
-                    entries.push(format!("{}: Top", name));
-                    entries.push(format!("{}: Popular", name));
-                    entries.push(format!("{}: New", name));
+                    entries.push(FeedEntry {
+                        title: format!("{}: Top", name),
+                        url: Some(url.clone()),
+                        summary: Some("Fallback OPDS entry".to_string()),
+                    });
+                    entries.push(FeedEntry {
+                        title: format!("{}: Popular", name),
+                        url: Some(url.clone()),
+                        summary: Some("Fallback OPDS entry".to_string()),
+                    });
+                    entries.push(FeedEntry {
+                        title: format!("{}: New", name),
+                        url: Some(url.clone()),
+                        summary: Some("Fallback OPDS entry".to_string()),
+                    });
                 }
                 FeedType::Rss => {
-                    entries.push(format!("{}: Headline 1", name));
-                    entries.push(format!("{}: Headline 2", name));
-                    entries.push(format!("{}: Headline 3", name));
+                    entries.push(FeedEntry {
+                        title: format!("{}: Headline 1", name),
+                        url: Some(url.clone()),
+                        summary: Some("Fallback RSS entry".to_string()),
+                    });
+                    entries.push(FeedEntry {
+                        title: format!("{}: Headline 2", name),
+                        url: Some(url.clone()),
+                        summary: Some("Fallback RSS entry".to_string()),
+                    });
+                    entries.push(FeedEntry {
+                        title: format!("{}: Headline 3", name),
+                        url: Some(url.clone()),
+                        summary: Some("Fallback RSS entry".to_string()),
+                    });
                 }
             }
         }
         if entries.is_empty() {
-            entries.push("No entries".to_string());
+            entries.push(FeedEntry {
+                title: "No entries".to_string(),
+                url: None,
+                summary: None,
+            });
         }
         entries
     }
@@ -463,6 +573,56 @@ impl HomeActivity {
                 &format!("{}{}", prefix, item),
             );
         }
+    }
+
+    fn draw_feed_entries(
+        ui_ctx: &mut dyn Ui<DefaultTheme>,
+        y_start: i16,
+        selected: usize,
+        items: &[FeedEntry],
+    ) {
+        for (idx, item) in items.iter().enumerate() {
+            let prefix = if idx == selected { "> " } else { "  " };
+            ui_ctx.draw_text_at(
+                Point {
+                    x: 18,
+                    y: y_start + (idx as i16 * 22),
+                },
+                &format!("{}{}", prefix, item.title),
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn fetch_live_feed_entries(&self, source_idx: usize) -> Option<Vec<FeedEntry>> {
+        let (_, url, _) = self.feed_sources.get(source_idx)?;
+        let response = ureq::get(url).call().ok()?;
+        let mut body = response.into_body();
+        let bytes = body.read_to_vec().ok()?;
+
+        let parsed = feed_rs::parser::parse(&bytes[..]).ok()?;
+        let mut entries = Vec::new();
+        for entry in parsed.entries.iter().take(32) {
+            entries.push(FeedEntry {
+                title: entry
+                    .title
+                    .as_ref()
+                    .map(|t| t.content.clone())
+                    .unwrap_or_else(|| "Untitled".to_string()),
+                url: entry.links.first().map(|l| l.href.clone()),
+                summary: entry.summary.as_ref().map(|s| s.content.clone()),
+            });
+        }
+        if entries.is_empty() {
+            None
+        } else {
+            Some(entries)
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    fn fetch_live_feed_entries(&self, _source_idx: usize) -> Option<Vec<FeedEntry>> {
+        None
     }
 
     fn draw_reader_lines(ui_ctx: &mut dyn Ui<DefaultTheme>, lines: &[String], scroll: usize) {
@@ -673,12 +833,21 @@ impl Activity<DefaultTheme> for HomeActivity {
                     }
                     InputEvent::Press(Button::Confirm) => {
                         let item_idx = *selected_idx;
-                        let title = entries[item_idx].clone();
-                        let lines = vec![
-                            format!("Entry: {}", title),
-                            "Feed item opened.".to_string(),
-                            "Back returns to entries.".to_string(),
-                        ];
+                        let item = entries[item_idx].clone();
+                        let title = item.title.clone();
+                        let mut lines = Vec::new();
+                        lines.push(format!("Entry: {}", item.title));
+                        if let Some(summary) = item.summary {
+                            for line in summary.lines().take(24) {
+                                lines.push(line.to_string());
+                            }
+                        }
+                        if let Some(url) = item.url {
+                            lines.push(String::new());
+                            lines.push(format!("URL: {}", url));
+                        }
+                        lines.push(String::new());
+                        lines.push("Back returns to entries.".to_string());
                         let restore_entries = entries.clone();
                         self.modal = ModalState::FeedItem {
                             source_idx: *source_idx,
@@ -830,7 +999,7 @@ impl Activity<DefaultTheme> for HomeActivity {
                     1,
                 );
                 ui_ctx.draw_text_at(Point { x: 18, y: 56 }, title);
-                Self::draw_list_str(ui_ctx, 88, *selected_idx, entries);
+                Self::draw_feed_entries(ui_ctx, 88, *selected_idx, entries);
             }
             ModalState::FeedItem {
                 title,

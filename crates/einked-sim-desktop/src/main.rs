@@ -13,6 +13,7 @@ use einked::refresh::RefreshHint;
 use einked::render_ir::DrawCmd;
 use einked::storage::{FileStore, FileStoreError, SettingsStore};
 use einked_ereader::{DeviceConfig, EreaderRuntime, FrameSink};
+use std::io::Read;
 use std::path::PathBuf;
 
 struct DesktopSink<'a> {
@@ -131,9 +132,8 @@ impl FileStore for DesktopFiles {
 
     fn read<'a>(&self, path: &str, buf: &'a mut [u8]) -> Result<&'a [u8], FileStoreError> {
         let full = self.resolve(path);
-        let data = std::fs::read(full).map_err(|_| FileStoreError::Io)?;
-        let n = data.len().min(buf.len());
-        buf[..n].copy_from_slice(&data[..n]);
+        let mut file = std::fs::File::open(full).map_err(|_| FileStoreError::Io)?;
+        let n = file.read(buf).map_err(|_| FileStoreError::Io)?;
         Ok(&buf[..n])
     }
 
