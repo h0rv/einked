@@ -45,6 +45,16 @@ pub trait FrameSink {
     fn render_and_flush(&mut self, cmds: &[DrawCmd<'static>], hint: RefreshHint) -> bool;
 }
 
+#[cfg(target_os = "espidf")]
+const FRAME_CMD_CAPACITY: usize = 128;
+#[cfg(not(target_os = "espidf"))]
+const FRAME_CMD_CAPACITY: usize = 512;
+
+#[cfg(target_os = "espidf")]
+const FRAME_PREV_CAPACITY: usize = 128;
+#[cfg(not(target_os = "espidf"))]
+const FRAME_PREV_CAPACITY: usize = 512;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayType {
     Mono1Bpp,
@@ -79,7 +89,7 @@ impl DeviceConfig {
 
 pub struct EreaderRuntime {
     stack: ActivityStack<DefaultTheme, 8>,
-    pipeline: FramePipeline<512, 512>,
+    pipeline: FramePipeline<FRAME_CMD_CAPACITY, FRAME_PREV_CAPACITY>,
     theme: DefaultTheme,
     settings: Box<dyn SettingsStore>,
     files: Box<dyn FileStore>,
@@ -157,7 +167,7 @@ impl Default for EreaderRuntime {
 }
 
 struct RuntimeUi<'a> {
-    runtime: UiRuntime<'a, 512>,
+    runtime: UiRuntime<'a, FRAME_CMD_CAPACITY>,
 }
 
 impl Ui<DefaultTheme> for RuntimeUi<'_> {
