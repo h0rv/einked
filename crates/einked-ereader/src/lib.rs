@@ -254,8 +254,26 @@ struct HomeActivity {
     files_idx: usize,
     feed_idx: usize,
     settings_idx: usize,
-    transfer_open: bool,
     transfer_menu_idx: usize,
+    modal: ModalState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModalState {
+    None,
+    Transfer,
+    BookDetail {
+        title: &'static str,
+        hint: &'static str,
+    },
+    FeedEntries {
+        source_idx: usize,
+        selected_idx: usize,
+    },
+    FeedItem {
+        source_idx: usize,
+        item_idx: usize,
+    },
 }
 
 impl HomeActivity {
@@ -266,8 +284,8 @@ impl HomeActivity {
             files_idx: 0,
             feed_idx: 0,
             settings_idx: 0,
-            transfer_open: false,
             transfer_menu_idx: 0,
+            modal: ModalState::None,
         }
     }
 
@@ -278,7 +296,12 @@ impl HomeActivity {
         "The Great Gatsby (7%)",
         "File Transfer",
     ];
-    const FILES_ITEMS: [&'static str; 4] = ["books/", "downloads/", "notes/", "samples/"];
+    const FILES_ITEMS: [&'static str; 4] = [
+        "Moby-Dick.epub",
+        "Pride-and-Prejudice.epub",
+        "Frankenstein.epub",
+        "notes.txt",
+    ];
     const FEED_ITEMS: [&'static str; 6] = [
         "Project Gutenberg (OPDS)",
         "Standard Ebooks (OPDS)",
@@ -295,6 +318,33 @@ impl HomeActivity {
         "Invert Colors: Off",
     ];
     const TRANSFER_ITEMS: [&'static str; 3] = ["Edit AP SSID", "Edit AP Password", "Start/Restart"];
+
+    fn feed_entries(source_idx: usize) -> &'static [&'static str] {
+        match source_idx {
+            0 => &["Top Books", "Recently Added", "Fiction"],
+            1 => &["Latest Releases", "Classic Literature", "Collections"],
+            2 => &["Public Domain", "Popular", "New Titles"],
+            3 => &["Top Story", "Second Story", "Third Story"],
+            4 => &["Frontpage #1", "Frontpage #2", "Frontpage #3"],
+            5 => &["Feature Essay", "Interview", "Reading List"],
+            _ => &["Entry 1", "Entry 2"],
+        }
+    }
+
+    fn feed_item_body(source_idx: usize, item_idx: usize) -> &'static str {
+        match source_idx {
+            0..=2 => match item_idx {
+                0 => "Catalog view. Confirm will eventually download/open EPUB.",
+                1 => "Navigation view. Use Back to return to source entries.",
+                _ => "Book list entry from OPDS source.",
+            },
+            _ => match item_idx {
+                0 => "RSS article preview.\n\nUse Back to return to feed entries.",
+                1 => "Second article preview.\n\nConfirm/Back are wired.",
+                _ => "Article preview from RSS source.",
+            },
+        }
+    }
 
     fn move_up(idx: &mut usize) {
         *idx = idx.saturating_sub(1);
@@ -379,6 +429,63 @@ impl HomeActivity {
         Self::draw_list(ui_ctx, 210, self.transfer_menu_idx, &Self::TRANSFER_ITEMS);
     }
 
+    fn render_book_detail(&self, ui_ctx: &mut dyn Ui<DefaultTheme>, title: &str, hint: &str) {
+        ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "Open Book");
+        ui_ctx.draw_line(
+            Point { x: 16, y: 34 },
+            Point { x: 464, y: 34 },
+            Color::Black,
+            1,
+        );
+        ui_ctx.draw_text_at(Point { x: 18, y: 72 }, title);
+        ui_ctx.draw_text_at(Point { x: 18, y: 100 }, hint);
+        ui_ctx.draw_text_at(
+            Point { x: 18, y: 128 },
+            "Reader hookup is next; buttons are active now.",
+        );
+    }
+
+    fn render_feed_entries(
+        &self,
+        ui_ctx: &mut dyn Ui<DefaultTheme>,
+        source_idx: usize,
+        selected: usize,
+    ) {
+        ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "Feed Entries");
+        ui_ctx.draw_line(
+            Point { x: 16, y: 34 },
+            Point { x: 464, y: 34 },
+            Color::Black,
+            1,
+        );
+        ui_ctx.draw_text_at(Point { x: 18, y: 56 }, Self::FEED_ITEMS[source_idx]);
+        Self::draw_list(ui_ctx, 88, selected, Self::feed_entries(source_idx));
+    }
+
+    fn render_feed_item(
+        &self,
+        ui_ctx: &mut dyn Ui<DefaultTheme>,
+        source_idx: usize,
+        item_idx: usize,
+    ) {
+        ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "Feed Item");
+        ui_ctx.draw_line(
+            Point { x: 16, y: 34 },
+            Point { x: 464, y: 34 },
+            Color::Black,
+            1,
+        );
+        ui_ctx.draw_text_at(Point { x: 18, y: 60 }, Self::FEED_ITEMS[source_idx]);
+        ui_ctx.draw_text_at(
+            Point { x: 18, y: 88 },
+            Self::feed_entries(source_idx)[item_idx],
+        );
+        ui_ctx.draw_text_at(
+            Point { x: 18, y: 120 },
+            Self::feed_item_body(source_idx, item_idx),
+        );
+    }
+
     fn render_bottom_bar(&self, ui_ctx: &mut dyn Ui<DefaultTheme>) {
         ui_ctx.draw_line(
             Point { x: 0, y: 772 },
@@ -386,15 +493,17 @@ impl HomeActivity {
             Color::Black,
             1,
         );
-        let left_hint = if self.transfer_open {
-            "Back: Exit transfer"
-        } else {
-            match self.tab {
+        let left_hint = match self.modal {
+            ModalState::Transfer => "Back: Exit transfer",
+            ModalState::BookDetail { .. } => "Back: Close",
+            ModalState::FeedEntries { .. } => "Back: Sources",
+            ModalState::FeedItem { .. } => "Back: Entries",
+            ModalState::None => match self.tab {
                 MainTab::Library => "Back: Refresh library",
                 MainTab::Files => "Back: Up",
                 MainTab::Feed => "Back: Sources",
                 MainTab::Settings => "Back: No-op",
-            }
+            },
         };
         ui_ctx.draw_text_at(Point { x: 14, y: 792 }, left_hint);
         ui_ctx.draw_text_at(Point { x: 215, y: 792 }, self.tab.dot_label());
@@ -408,22 +517,85 @@ impl Activity<DefaultTheme> for HomeActivity {
         event: InputEvent,
         _ctx: &mut Context<'_, DefaultTheme>,
     ) -> Transition<DefaultTheme> {
-        if self.transfer_open {
-            return match event {
-                InputEvent::Press(Button::Back) => {
-                    self.transfer_open = false;
-                    Transition::Stay
-                }
-                InputEvent::Press(Button::Up) | InputEvent::Press(Button::Aux1) => {
-                    Self::move_up(&mut self.transfer_menu_idx);
-                    Transition::Stay
-                }
-                InputEvent::Press(Button::Down) | InputEvent::Press(Button::Aux2) => {
-                    Self::move_down(&mut self.transfer_menu_idx, Self::TRANSFER_ITEMS.len());
-                    Transition::Stay
-                }
-                _ => Transition::Stay,
-            };
+        match self.modal {
+            ModalState::Transfer => {
+                return match event {
+                    InputEvent::Press(Button::Back) => {
+                        self.modal = ModalState::None;
+                        Transition::Stay
+                    }
+                    InputEvent::Press(Button::Up) | InputEvent::Press(Button::Aux1) => {
+                        Self::move_up(&mut self.transfer_menu_idx);
+                        Transition::Stay
+                    }
+                    InputEvent::Press(Button::Down) | InputEvent::Press(Button::Aux2) => {
+                        Self::move_down(&mut self.transfer_menu_idx, Self::TRANSFER_ITEMS.len());
+                        Transition::Stay
+                    }
+                    _ => Transition::Stay,
+                };
+            }
+            ModalState::BookDetail { .. } => {
+                return match event {
+                    InputEvent::Press(Button::Back) | InputEvent::Press(Button::Confirm) => {
+                        self.modal = ModalState::None;
+                        Transition::Stay
+                    }
+                    _ => Transition::Stay,
+                };
+            }
+            ModalState::FeedEntries {
+                source_idx,
+                mut selected_idx,
+            } => {
+                return match event {
+                    InputEvent::Press(Button::Back) => {
+                        self.modal = ModalState::None;
+                        Transition::Stay
+                    }
+                    InputEvent::Press(Button::Up) | InputEvent::Press(Button::Aux1) => {
+                        Self::move_up(&mut selected_idx);
+                        self.modal = ModalState::FeedEntries {
+                            source_idx,
+                            selected_idx,
+                        };
+                        Transition::Stay
+                    }
+                    InputEvent::Press(Button::Down) | InputEvent::Press(Button::Aux2) => {
+                        Self::move_down(&mut selected_idx, Self::feed_entries(source_idx).len());
+                        self.modal = ModalState::FeedEntries {
+                            source_idx,
+                            selected_idx,
+                        };
+                        Transition::Stay
+                    }
+                    InputEvent::Press(Button::Confirm) => {
+                        self.modal = ModalState::FeedItem {
+                            source_idx,
+                            item_idx: selected_idx,
+                        };
+                        Transition::Stay
+                    }
+                    _ => Transition::Stay,
+                };
+            }
+            ModalState::FeedItem {
+                source_idx,
+                item_idx,
+            } => {
+                return match event {
+                    InputEvent::Press(Button::Back) => {
+                        self.modal = ModalState::FeedEntries {
+                            source_idx,
+                            selected_idx: item_idx,
+                        };
+                        Transition::Stay
+                    }
+                    InputEvent::Press(Button::Confirm) => Transition::Stay,
+                    _ => Transition::Stay,
+                };
+            }
+            ModalState::None => {}
         }
 
         match event {
@@ -459,8 +631,29 @@ impl Activity<DefaultTheme> for HomeActivity {
             }
             InputEvent::Press(Button::Confirm) => match self.tab {
                 MainTab::Library if self.library_idx == Self::LIBRARY_ITEMS.len() - 1 => {
-                    self.transfer_open = true;
+                    self.modal = ModalState::Transfer;
                     self.transfer_menu_idx = 0;
+                    Transition::Stay
+                }
+                MainTab::Library => {
+                    self.modal = ModalState::BookDetail {
+                        title: Self::LIBRARY_ITEMS[self.library_idx],
+                        hint: "Confirm: Open  Back: Close",
+                    };
+                    Transition::Stay
+                }
+                MainTab::Files => {
+                    self.modal = ModalState::BookDetail {
+                        title: Self::FILES_ITEMS[self.files_idx],
+                        hint: "Confirm: Open  Back: Close",
+                    };
+                    Transition::Stay
+                }
+                MainTab::Feed => {
+                    self.modal = ModalState::FeedEntries {
+                        source_idx: self.feed_idx,
+                        selected_idx: 0,
+                    };
                     Transition::Stay
                 }
                 _ => Transition::Stay,
@@ -480,20 +673,92 @@ impl Activity<DefaultTheme> for HomeActivity {
             Color::White,
         );
 
-        if self.transfer_open {
-            self.render_transfer_screen(ui_ctx);
-        } else {
-            match self.tab {
+        match self.modal {
+            ModalState::Transfer => self.render_transfer_screen(ui_ctx),
+            ModalState::BookDetail { title, hint } => self.render_book_detail(ui_ctx, title, hint),
+            ModalState::FeedEntries {
+                source_idx,
+                selected_idx,
+            } => self.render_feed_entries(ui_ctx, source_idx, selected_idx),
+            ModalState::FeedItem {
+                source_idx,
+                item_idx,
+            } => self.render_feed_item(ui_ctx, source_idx, item_idx),
+            ModalState::None => match self.tab {
                 MainTab::Library => self.render_library(ui_ctx),
                 MainTab::Files => self.render_files(ui_ctx),
                 MainTab::Feed => self.render_feed(ui_ctx),
                 MainTab::Settings => self.render_settings(ui_ctx),
-            }
+            },
         }
         self.render_bottom_bar(ui_ctx);
     }
 
     fn refresh_hint(&self) -> RefreshHint {
         RefreshHint::Fast
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DummyUi;
+
+    impl Ui<DefaultTheme> for DummyUi {}
+
+    fn test_ctx<'a>(
+        settings: &'a mut NoopSettings,
+        files: &'a mut NoopFiles,
+    ) -> Context<'a, DefaultTheme> {
+        Context {
+            theme: &DefaultTheme,
+            screen: DeviceConfig::xteink_x4().screen,
+            settings,
+            files,
+        }
+    }
+
+    #[test]
+    fn confirm_on_feed_opens_entries_and_back_returns() {
+        let mut act = HomeActivity::new();
+        let mut settings = NoopSettings::default();
+        let mut files = NoopFiles;
+        let mut ctx = test_ctx(&mut settings, &mut files);
+
+        let _ = act.on_input(InputEvent::Press(Button::Right), &mut ctx);
+        let _ = act.on_input(InputEvent::Press(Button::Right), &mut ctx);
+        let _ = act.on_input(InputEvent::Press(Button::Confirm), &mut ctx);
+        assert!(matches!(act.modal, ModalState::FeedEntries { .. }));
+
+        let _ = act.on_input(InputEvent::Press(Button::Confirm), &mut ctx);
+        assert!(matches!(act.modal, ModalState::FeedItem { .. }));
+
+        let _ = act.on_input(InputEvent::Press(Button::Back), &mut ctx);
+        assert!(matches!(act.modal, ModalState::FeedEntries { .. }));
+
+        let _ = act.on_input(InputEvent::Press(Button::Back), &mut ctx);
+        assert!(matches!(act.modal, ModalState::None));
+
+        let mut ui = DummyUi;
+        act.render(&mut ui);
+    }
+
+    #[test]
+    fn confirm_on_library_and_files_opens_detail_modal() {
+        let mut act = HomeActivity::new();
+        let mut settings = NoopSettings::default();
+        let mut files = NoopFiles;
+        let mut ctx = test_ctx(&mut settings, &mut files);
+
+        let _ = act.on_input(InputEvent::Press(Button::Confirm), &mut ctx);
+        assert!(matches!(act.modal, ModalState::BookDetail { .. }));
+        let _ = act.on_input(InputEvent::Press(Button::Back), &mut ctx);
+        assert!(matches!(act.modal, ModalState::None));
+
+        let _ = act.on_input(InputEvent::Press(Button::Right), &mut ctx);
+        let _ = act.on_input(InputEvent::Press(Button::Down), &mut ctx);
+        let _ = act.on_input(InputEvent::Press(Button::Confirm), &mut ctx);
+        assert!(matches!(act.modal, ModalState::BookDetail { .. }));
     }
 }
