@@ -373,10 +373,6 @@ impl HomeActivity {
 
         entries.sort();
         entries.dedup();
-        if entries.is_empty() {
-            entries.push("sample_books/notes.txt".to_string());
-            entries.push("sample_books/Frankenstein.epub".to_string());
-        }
         self.files = entries;
         self.library_idx = self
             .library_idx
@@ -501,87 +497,51 @@ impl HomeActivity {
     }
 
     #[cfg(feature = "std")]
-    fn read_epub_lines(&self, path: &str, bytes: &[u8]) -> Vec<String> {
+    fn read_epub_lines(&self, _path: &str, bytes: &[u8]) -> Vec<String> {
         let cursor = Cursor::new(bytes.to_vec());
         let mut book = match EpubBook::builder().from_reader(cursor) {
             Ok(book) => book,
             Err(err) => {
-                return vec![
-                    format!("EPUB: {}", path),
-                    format!("Failed to parse EPUB: {}", err),
-                ];
+                return vec![format!("Failed to parse EPUB: {}", err)];
             }
         };
 
         if book.chapter_count() == 0 {
-            return vec![
-                format!("Title: {}", book.title()),
-                "(EPUB has no chapters)".to_string(),
-            ];
+            return vec!["EPUB has no chapters.".to_string()];
         }
 
         let engine = RenderEngine::new(RenderEngineOptions::for_display(448, 700));
-        let probe_chapters = book.chapter_count().min(12);
-        for chapter_idx in 0..probe_chapters {
-            let Ok(pages) = engine.prepare_chapter(&mut book, chapter_idx) else {
-                continue;
-            };
-            let mut body = Vec::new();
-            for page in pages.iter().take(3) {
-                for cmd in &page.content_commands {
-                    if let EpubDrawCommand::Text(text) = cmd {
-                        let trimmed = text.text.trim();
-                        if trimmed.is_empty() || Self::is_epub_boilerplate_line(trimmed) {
-                            continue;
-                        }
-                        body.push(trimmed.to_string());
-                        if body.len() >= 120 {
-                            break;
-                        }
+        let pages = match engine.prepare_chapter(&mut book, 0) {
+            Ok(pages) => pages,
+            Err(err) => {
+                return vec![format!("EPUB render failed: {}", err)];
+            }
+        };
+        let mut body = Vec::new();
+        for page in pages.iter().take(3) {
+            for cmd in &page.content_commands {
+                if let EpubDrawCommand::Text(text) = cmd {
+                    let trimmed = text.text.trim();
+                    if trimmed.is_empty() || Self::is_epub_boilerplate_line(trimmed) {
+                        continue;
+                    }
+                    body.push(trimmed.to_string());
+                    if body.len() >= 120 {
+                        break;
                     }
                 }
-                if body.len() >= 120 {
-                    break;
-                }
             }
-            if body.len() >= 24 {
-                let mut lines = vec![format!("Chapter {}", chapter_idx + 1), String::new()];
-                lines.extend(body);
-                return lines;
+            if body.len() >= 120 {
+                break;
             }
         }
-
-        if let Ok(pages) = engine.prepare_chapter(&mut book, 0) {
-            let mut body = Vec::new();
-            for page in pages.iter().take(2) {
-                for cmd in &page.content_commands {
-                    if let EpubDrawCommand::Text(text) = cmd {
-                        let trimmed = text.text.trim();
-                        if trimmed.is_empty() || Self::is_epub_boilerplate_line(trimmed) {
-                            continue;
-                        }
-                        body.push(trimmed.to_string());
-                        if body.len() >= 120 {
-                            break;
-                        }
-                    }
-                }
-                if body.len() >= 120 {
-                    break;
-                }
-            }
-            if !body.is_empty() {
-                let mut lines = vec!["Chapter 1".to_string(), String::new()];
-                lines.extend(body);
-                return lines;
-            }
+        if !body.is_empty() {
+            let mut lines = vec!["Chapter 1".to_string(), String::new()];
+            lines.extend(body);
+            return lines;
         }
 
-        vec![
-            format!("Title: {}", book.title()),
-            "Unable to render readable chapter content.".to_string(),
-            format!("Path: {}", path),
-        ]
+        vec!["No readable text produced by renderer.".to_string()]
     }
 
     #[cfg(not(feature = "std"))]
@@ -616,57 +576,14 @@ impl HomeActivity {
     }
 
     fn feed_entries_for_source(&self, source_idx: usize) -> Vec<FeedEntry> {
-        if let Some(entries) = self.fetch_live_feed_entries(source_idx) {
-            return entries;
-        }
-
-        let mut entries = Vec::new();
-        if let Some((name, url, ty)) = self.feed_sources.get(source_idx) {
-            match ty {
-                FeedType::Opds => {
-                    entries.push(FeedEntry {
-                        title: format!("{}: Top", name),
-                        url: Some(url.clone()),
-                        summary: Some("Fallback OPDS entry".to_string()),
-                    });
-                    entries.push(FeedEntry {
-                        title: format!("{}: Popular", name),
-                        url: Some(url.clone()),
-                        summary: Some("Fallback OPDS entry".to_string()),
-                    });
-                    entries.push(FeedEntry {
-                        title: format!("{}: New", name),
-                        url: Some(url.clone()),
-                        summary: Some("Fallback OPDS entry".to_string()),
-                    });
-                }
-                FeedType::Rss => {
-                    entries.push(FeedEntry {
-                        title: format!("{}: Headline 1", name),
-                        url: Some(url.clone()),
-                        summary: Some("Fallback RSS entry".to_string()),
-                    });
-                    entries.push(FeedEntry {
-                        title: format!("{}: Headline 2", name),
-                        url: Some(url.clone()),
-                        summary: Some("Fallback RSS entry".to_string()),
-                    });
-                    entries.push(FeedEntry {
-                        title: format!("{}: Headline 3", name),
-                        url: Some(url.clone()),
-                        summary: Some("Fallback RSS entry".to_string()),
-                    });
-                }
-            }
-        }
-        if entries.is_empty() {
-            entries.push(FeedEntry {
-                title: "No entries".to_string(),
-                url: None,
-                summary: None,
-            });
-        }
-        entries
+        self.fetch_live_feed_entries(source_idx)
+            .unwrap_or_else(|| {
+                vec![FeedEntry {
+                    title: "No entries available".to_string(),
+                    url: None,
+                    summary: Some("Feed load failed or returned no entries.".to_string()),
+                }]
+            })
     }
 
     fn draw_list_str(
