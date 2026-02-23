@@ -324,6 +324,12 @@ enum ModalState {
         lines: Vec<String>,
         scroll: usize,
     },
+    FeedOffline {
+        source_idx: usize,
+        title: String,
+        message: String,
+        requested_enable: bool,
+    },
 }
 
 #[derive(Clone)]
@@ -395,6 +401,8 @@ impl HomeActivity {
     const SETTING_KEY_AUTO_SLEEP: u8 = 3;
     const SETTING_KEY_REFRESH: u8 = 4;
     const SETTING_KEY_INVERT_COLORS: u8 = 5;
+    const SETTING_KEY_WIFI_ACTIVE: u8 = 240;
+    const SETTING_KEY_WIFI_ENABLE_REQUEST: u8 = 241;
 
     fn move_up(idx: &mut usize) {
         *idx = idx.saturating_sub(1);
@@ -458,6 +466,27 @@ impl HomeActivity {
 
     fn save_setting_idx(ctx: &mut Context<'_, DefaultTheme>, key: u8, idx: usize) {
         ctx.settings.save_raw(key, &[idx as u8]);
+    }
+
+    fn wifi_is_active(ctx: &mut Context<'_, DefaultTheme>) -> bool {
+        let mut buf = [0u8; 1];
+        ctx.settings
+            .load_raw(Self::SETTING_KEY_WIFI_ACTIVE, &mut buf)
+            == 1
+            && buf[0] != 0
+    }
+
+    fn request_wifi_enable(ctx: &mut Context<'_, DefaultTheme>) {
+        ctx.settings
+            .save_raw(Self::SETTING_KEY_WIFI_ENABLE_REQUEST, &[1]);
+    }
+
+    fn feed_backend_available() -> bool {
+        cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        ))
     }
 
     fn settings_items(&self) -> Vec<String> {
@@ -1242,6 +1271,7 @@ impl HomeActivity {
             ModalState::FeedEntries { .. } => "Back: Sources",
             ModalState::FeedItem { .. } => "Back: Entries",
             ModalState::FeedArticle { .. } => "Back: Entry",
+            ModalState::FeedOffline { .. } => "Back: Feed",
             ModalState::None => match self.tab {
                 MainTab::Library => "Back: Refresh library",
                 MainTab::Files => "Back: Up",
@@ -1564,6 +1594,30 @@ impl Activity<DefaultTheme> for HomeActivity {
                     _ => Transition::Stay,
                 };
             }
+            ModalState::FeedOffline {
+                source_idx,
+                title,
+                requested_enable: _,
+                message,
+            } => {
+                return match event {
+                    InputEvent::Press(Button::Back) => {
+                        self.modal = ModalState::None;
+                        Transition::Stay
+                    }
+                    InputEvent::Press(Button::Confirm) => {
+                        Self::request_wifi_enable(ctx);
+                        self.modal = ModalState::FeedOffline {
+                            source_idx: *source_idx,
+                            title: title.clone(),
+                            message: message.clone(),
+                            requested_enable: true,
+                        };
+                        Transition::Stay
+                    }
+                    _ => Transition::Stay,
+                };
+            }
             ModalState::None => {}
         }
 
@@ -1624,6 +1678,27 @@ impl Activity<DefaultTheme> for HomeActivity {
                 }
                 MainTab::Feed => {
                     let source_idx = self.feed_idx.min(self.feed_sources.len().saturating_sub(1));
+                    if !Self::wifi_is_active(ctx) {
+                        self.modal = ModalState::FeedOffline {
+                            source_idx,
+                            title: self.feed_sources[source_idx].0.clone(),
+                            message:
+                                "Wi-Fi is OFFLINE. Feeds require an active Wi-Fi connection."
+                                    .to_string(),
+                            requested_enable: false,
+                        };
+                        return Transition::Stay;
+                    }
+                    if !Self::feed_backend_available() {
+                        self.modal = ModalState::FeedOffline {
+                            source_idx,
+                            title: self.feed_sources[source_idx].0.clone(),
+                            message: "Feed networking is not available in this firmware build."
+                                .to_string(),
+                            requested_enable: false,
+                        };
+                        return Transition::Stay;
+                    }
                     let entries = self.feed_entries_for_source(source_idx);
                     let title = self.feed_sources[source_idx].0.clone();
                     self.modal = ModalState::FeedEntries {
@@ -1696,6 +1771,27 @@ impl Activity<DefaultTheme> for HomeActivity {
                 scroll,
                 ..
             } => self.render_reader(ui_ctx, title, lines, *scroll),
+            ModalState::FeedOffline {
+                title,
+                message,
+                requested_enable,
+                ..
+            } => {
+                let mut lines = vec![
+                    format!("Feed source: {}", title),
+                    String::new(),
+                    message.clone(),
+                    String::new(),
+                    "Press Confirm to enable Wi-Fi now.".to_string(),
+                    "Press Back to cancel.".to_string(),
+                ];
+                if *requested_enable {
+                    lines.push(String::new());
+                    lines.push("Wi-Fi enable requested.".to_string());
+                    lines.push("Wait a moment, then press Confirm again.".to_string());
+                }
+                self.render_reader(ui_ctx, "Feed Network Required", &lines, 0);
+            }
             ModalState::None => match self.tab {
                 MainTab::Library => self.render_library(ui_ctx),
                 MainTab::Files => self.render_files(ui_ctx),
