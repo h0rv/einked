@@ -446,10 +446,7 @@ impl HomeActivity {
         config: DeviceConfig,
         feed_client: Rc<RefCell<Box<dyn FeedClient>>>,
     ) -> Self {
-        let mut feed_sources = Vec::new();
-        for (name, url, ty) in all_preloaded_sources() {
-            feed_sources.push((name.to_string(), url.to_string(), ty));
-        }
+        let feed_sources = Self::build_feed_sources();
         Self {
             tab: MainTab::Library,
             library_idx: 0,
@@ -471,6 +468,20 @@ impl HomeActivity {
             epub_session: None,
             feed_client,
             modal: ModalState::None,
+        }
+    }
+
+    fn build_feed_sources() -> Vec<(String, String, FeedType)> {
+        let mut feed_sources = Vec::new();
+        for (name, url, ty) in all_preloaded_sources() {
+            feed_sources.push((name.to_string(), url.to_string(), ty));
+        }
+        feed_sources
+    }
+
+    fn ensure_feed_sources_loaded(&mut self) {
+        if self.feed_sources.is_empty() {
+            self.feed_sources = Self::build_feed_sources();
         }
     }
 
@@ -1296,6 +1307,9 @@ impl HomeActivity {
             // Drop list allocations before EPUB open to improve contiguous heap headroom.
             self.files.clear();
             self.files.shrink_to_fit();
+            // These are static source descriptors; reclaim their heap while reader is active.
+            self.feed_sources.clear();
+            self.feed_sources.shrink_to_fit();
         }
         let cfg = EpubLoadConfig {
             font_size_idx: self.font_size_idx,
@@ -1741,6 +1755,9 @@ impl Activity<DefaultTheme> for HomeActivity {
         event: InputEvent,
         ctx: &mut Context<'_, DefaultTheme>,
     ) -> Transition<DefaultTheme> {
+        if matches!(self.tab, MainTab::Feed) {
+            self.ensure_feed_sources_loaded();
+        }
         let epub_nav_cfg = EpubLoadConfig {
             font_size_idx: self.font_size_idx,
             auto_sleep_idx: self.auto_sleep_idx,
