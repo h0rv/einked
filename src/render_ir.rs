@@ -5,6 +5,10 @@ use heapless::Vec;
 use crate::core::{Color, Point, Rect, TextStyle};
 
 /// Maximum inline UTF-8 bytes stored by a draw-text command.
+#[cfg(target_os = "espidf")]
+pub const DRAW_TEXT_CAPACITY: usize = 96;
+/// Maximum inline UTF-8 bytes stored by a draw-text command.
+#[cfg(not(target_os = "espidf"))]
 pub const DRAW_TEXT_CAPACITY: usize = 192;
 pub type DrawTextBuf = heapless::String<DRAW_TEXT_CAPACITY>;
 

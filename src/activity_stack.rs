@@ -67,6 +67,9 @@ pub trait Activity<T: Theme> {
     fn on_resume(&mut self, _ctx: &mut Context<'_, T>) {}
     fn on_exit(&mut self, _ctx: &mut Context<'_, T>) {}
     fn on_input(&mut self, event: InputEvent, ctx: &mut Context<'_, T>) -> Transition<T>;
+    fn on_idle(&mut self, _ctx: &mut Context<'_, T>) -> Transition<T> {
+        Transition::Stay
+    }
     fn render(&self, ui: &mut dyn Ui<T>);
     fn refresh_hint(&self) -> RefreshHint {
         RefreshHint::Adaptive
@@ -112,7 +115,7 @@ impl<T: Theme, const DEPTH: usize> ActivityStack<T, DEPTH> {
         let transition = if let Some(event) = input {
             top.on_input(event, ctx)
         } else {
-            Transition::Stay
+            top.on_idle(ctx)
         };
 
         self.apply_transition(transition, ctx);
@@ -215,8 +218,10 @@ impl<T: Theme, const DEPTH: usize> ActivityStack<T, DEPTH> {
             } else {
                 Transition::Pop
             }
+        } else if let Some(top) = factory.get_mut(top_id) {
+            top.on_idle(ctx)
         } else {
-            Transition::Stay
+            Transition::Pop
         };
 
         self.apply_transition(transition, factory, ctx);
