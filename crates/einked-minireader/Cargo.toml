@@ -1,0 +1,15 @@
+[package]
+name = "einked-minireader"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+einked = { path = "../..", features = ["std"] }
+epub-stream = { path = "../../../epub-stream", default-features = false, features = ["std"] }
+epub_stream_render = { package = "epub-stream-render", path = "../../../epub-stream/crates/epub-stream-render" }
+
+[features]
+default = ["std"]
+std = ["einked/std"]
+
+[workspace]
