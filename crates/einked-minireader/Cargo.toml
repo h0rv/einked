@@ -11,5 +11,3 @@ epub_stream_render = { package = "epub-stream-render", path = "../../../epub-str
 [features]
 default = ["std"]
 std = ["einked/std"]
-
-[workspace]

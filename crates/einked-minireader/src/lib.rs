@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 
 use einked::activity_stack::{Activity, ActivityStack, Context, Transition, Ui};
 use einked::core::{Color, DefaultTheme, Point, Rect};
+use einked::dsl::UiDsl;
 use einked::input::{Button, InputEvent};
 use einked::pipeline::FramePipeline;
 use einked::refresh::RefreshHint;
@@ -21,7 +22,9 @@ use epub_stream::book::{ChapterEventsOptions, OpenConfig};
 #[cfg(feature = "std")]
 use epub_stream::{EpubBook, EpubBookOptions, ScratchBuffers, ValidationMode, ZipLimits};
 #[cfg(feature = "std")]
-use epub_stream_render::{DrawCommand, RenderConfig, RenderEngine, RenderEngineOptions, RenderPage};
+use epub_stream_render::{
+    DrawCommand, RenderConfig, RenderEngine, RenderEngineOptions, RenderPage,
+};
 
 pub trait FrameSink {
     fn render_and_flush(&mut self, cmds: &[DrawCmd<'static>], hint: RefreshHint) -> bool;
@@ -194,7 +197,6 @@ struct ReaderSession {
     scratch: ScratchBuffers,
     chapter_idx: usize,
     page_idx: usize,
-    chapter_count: usize,
 }
 
 struct HomeActivity {
@@ -226,6 +228,8 @@ impl HomeActivity {
     const CHAPTER_BUF_MAX: usize = 48 * 1024;
     #[cfg(feature = "std")]
     const CHAPTER_GROW_RETRIES: usize = 4;
+    #[cfg(feature = "std")]
+    const PAGE_SCAN_AHEAD: usize = 8;
 
     fn new(library_root: &str, battery_key: u8, screen: Rect) -> Self {
         Self {
@@ -303,10 +307,8 @@ impl HomeActivity {
 
     #[cfg(feature = "std")]
     fn create_engine(&self) -> RenderEngine {
-        let mut opts = RenderEngineOptions::for_display(
-            self.screen.width as i32,
-            self.screen.height as i32,
-        );
+        let mut opts =
+            RenderEngineOptions::for_display(self.screen.width as i32, self.screen.height as i32);
         opts.layout.margin_left = 10;
         opts.layout.margin_right = 10;
         opts.layout.margin_top = 6;
@@ -355,17 +357,22 @@ impl HomeActivity {
             },
             chapter_idx: 0,
             page_idx: 0,
-            chapter_count,
         };
-        let (lines, total_pages) = Self::load_page_lines(&mut session, 0, 0)?;
+        let Some((actual_chapter_idx, actual_page_idx, total_pages, lines)) =
+            Self::find_next_readable_page(&mut session, chapter_count, 0, 0)?
+        else {
+            return Err("No readable text produced by renderer.".to_string());
+        };
         self.mode = Mode::Reader {
             title: book.name.clone(),
             lines,
-            chapter_idx: 0,
+            chapter_idx: actual_chapter_idx,
             chapter_count,
-            page_idx: 0,
+            page_idx: actual_page_idx,
             total_pages,
         };
+        session.chapter_idx = actual_chapter_idx;
+        session.page_idx = actual_page_idx;
         self.session = Some(session);
         Ok(())
     }
@@ -415,85 +422,115 @@ impl HomeActivity {
     }
 
     #[cfg(feature = "std")]
+    fn find_next_readable_page(
+        session: &mut ReaderSession,
+        chapter_count: usize,
+        start_chapter_idx: usize,
+        start_page_idx: usize,
+    ) -> Result<Option<(usize, usize, usize, Vec<String>)>, String> {
+        for chapter_idx in start_chapter_idx..chapter_count {
+            let page_idx = if chapter_idx == start_chapter_idx {
+                start_page_idx
+            } else {
+                0
+            };
+            if let Some((lines, total_pages, actual_page_idx)) =
+                Self::load_page_lines(session, chapter_idx, page_idx)?
+            {
+                return Ok(Some((chapter_idx, actual_page_idx, total_pages, lines)));
+            }
+        }
+        Ok(None)
+    }
+
+    #[cfg(feature = "std")]
     fn load_page_lines(
         session: &mut ReaderSession,
         chapter_idx: usize,
         page_idx: usize,
-    ) -> Result<(Vec<String>, usize), String> {
+    ) -> Result<Option<(Vec<String>, usize, usize)>, String> {
         let chapter_opts = ChapterEventsOptions {
             max_items: Self::MAX_CHAPTER_EVENTS,
             ..ChapterEventsOptions::default()
         };
-        let mut grow_retries = 0usize;
-        loop {
-            let config = RenderConfig::default().with_page_range(page_idx..page_idx + 1);
-            let mut render_session = session.engine.begin(chapter_idx, config);
-            let mut picked: Option<RenderPage> = None;
-            let mut layout_error: Option<String> = None;
-            let stream_result = session.book.chapter_events_with_scratch(
-                chapter_idx,
-                chapter_opts,
-                &mut session.chapter_buf,
-                &mut session.scratch,
-                |item| {
-                    if layout_error.is_some() || picked.is_some() {
-                        return Ok::<(), epub_stream::EpubError>(());
-                    }
-                    if let Err(err) = render_session.push(item) {
-                        layout_error = Some(err.to_string());
-                        return Ok::<(), epub_stream::EpubError>(());
-                    }
-                    render_session.drain_pages(|p| {
-                        if picked.is_none() {
-                            picked = Some(p);
+        for candidate_page in page_idx..=page_idx.saturating_add(Self::PAGE_SCAN_AHEAD) {
+            let mut grow_retries = 0usize;
+            loop {
+                let config =
+                    RenderConfig::default().with_page_range(candidate_page..candidate_page + 1);
+                let mut render_session = session.engine.begin(chapter_idx, config);
+                let mut picked: Option<RenderPage> = None;
+                let mut layout_error: Option<String> = None;
+                let stream_result = session.book.chapter_events_with_scratch(
+                    chapter_idx,
+                    chapter_opts,
+                    &mut session.chapter_buf,
+                    &mut session.scratch,
+                    |item| {
+                        if layout_error.is_some() || picked.is_some() {
+                            return Ok::<(), epub_stream::EpubError>(());
                         }
-                    });
-                    Ok::<(), epub_stream::EpubError>(())
-                },
-            );
-            if let Err(err) = stream_result {
-                let err_s = err.to_string();
-                let buffer_small = err_s.to_ascii_lowercase().contains("buffer too small");
-                if buffer_small
-                    && grow_retries < Self::CHAPTER_GROW_RETRIES
-                    && Self::grow_chapter_buf(session)?
-                {
-                    grow_retries += 1;
-                    continue;
-                }
-                return Err(format!("Render stream failed: {}", err_s));
-            }
-            if let Some(err) = layout_error {
-                return Err(format!("Render layout failed: {}", err));
-            }
-            render_session
-                .finish()
-                .map_err(|e| format!("Render finalize failed: {}", e))?;
-            render_session.drain_pages(|p| {
-                if picked.is_none() {
-                    picked = Some(p);
-                }
-            });
-            let Some(page) = picked else {
-                return Err("No readable page".to_string());
-            };
-            let total_pages = page.metrics.chapter_page_count.unwrap_or(page_idx + 1).max(1);
-            let mut lines = Vec::new();
-            let max_chars = 56usize;
-            for cmd in page.content_commands {
-                if let DrawCommand::Text(text) = cmd {
-                    let t = text.text.trim();
-                    if t.is_empty() {
+                        if let Err(err) = render_session.push(item) {
+                            layout_error = Some(err.to_string());
+                            return Ok::<(), epub_stream::EpubError>(());
+                        }
+                        render_session.drain_pages(|p| {
+                            if picked.is_none() {
+                                picked = Some(p);
+                            }
+                        });
+                        Ok::<(), epub_stream::EpubError>(())
+                    },
+                );
+                if let Err(err) = stream_result {
+                    let err_s = err.to_string();
+                    let buffer_small = err_s.to_ascii_lowercase().contains("buffer too small");
+                    if buffer_small
+                        && grow_retries < Self::CHAPTER_GROW_RETRIES
+                        && Self::grow_chapter_buf(session)?
+                    {
+                        grow_retries += 1;
                         continue;
                     }
-                    Self::wrap_line(t, max_chars, &mut lines);
+                    return Err(format!("Render stream failed: {}", err_s));
                 }
+                if let Some(err) = layout_error {
+                    return Err(format!("Render layout failed: {}", err));
+                }
+                render_session
+                    .finish()
+                    .map_err(|e| format!("Render finalize failed: {}", e))?;
+                render_session.drain_pages(|p| {
+                    if picked.is_none() {
+                        picked = Some(p);
+                    }
+                });
+                let Some(page) = picked else {
+                    break;
+                };
+                let total_pages = page
+                    .metrics
+                    .chapter_page_count
+                    .unwrap_or(candidate_page + 1)
+                    .max(1);
+                let mut lines = Vec::new();
+                let max_chars = 56usize;
+                for cmd in page.content_commands {
+                    if let DrawCommand::Text(text) = cmd {
+                        let t = text.text.trim();
+                        if t.is_empty() {
+                            continue;
+                        }
+                        Self::wrap_line(t, max_chars, &mut lines);
+                    }
+                }
+                if lines.is_empty() {
+                    break;
+                }
+                return Ok(Some((lines, total_pages, candidate_page)));
             }
-            if lines.is_empty() {
-                return Err("No readable text".to_string());
-            }
-            return Ok((lines, total_pages));
         }
+        Ok(None)
     }
 }
 
@@ -552,26 +589,21 @@ impl Activity<DefaultTheme> for HomeActivity {
                 InputEvent::Press(Button::Right) => {
                     if let Some(session) = self.session.as_mut() {
                         let target_page = *page_idx + 1;
-                        match Self::load_page_lines(session, *chapter_idx, target_page) {
-                            Ok((new_lines, pages)) => {
+                        match Self::find_next_readable_page(
+                            session,
+                            *chapter_count,
+                            *chapter_idx,
+                            target_page,
+                        ) {
+                            Ok(Some((next_ch, actual_page, pages, new_lines))) => {
                                 *lines = new_lines;
-                                *page_idx = target_page;
+                                *chapter_idx = next_ch;
+                                *page_idx = actual_page;
                                 *total_pages = pages;
+                                session.chapter_idx = *chapter_idx;
                                 session.page_idx = *page_idx;
                             }
-                            Err(_) if *chapter_idx + 1 < *chapter_count => {
-                                let next_ch = *chapter_idx + 1;
-                                if let Ok((new_lines, pages)) =
-                                    Self::load_page_lines(session, next_ch, 0)
-                                {
-                                    *lines = new_lines;
-                                    *chapter_idx = next_ch;
-                                    *page_idx = 0;
-                                    *total_pages = pages;
-                                    session.chapter_idx = *chapter_idx;
-                                    session.page_idx = *page_idx;
-                                }
-                            }
+                            Ok(None) => {}
                             Err(_) => {}
                         }
                     }
@@ -581,22 +613,22 @@ impl Activity<DefaultTheme> for HomeActivity {
                     if let Some(session) = self.session.as_mut() {
                         if *page_idx > 0 {
                             let target_page = *page_idx - 1;
-                            if let Ok((new_lines, pages)) =
+                            if let Ok(Some((new_lines, pages, actual_page))) =
                                 Self::load_page_lines(session, *chapter_idx, target_page)
                             {
                                 *lines = new_lines;
-                                *page_idx = target_page;
+                                *page_idx = actual_page;
                                 *total_pages = pages;
                                 session.page_idx = *page_idx;
                             }
                         } else if *chapter_idx > 0 {
                             let prev_ch = *chapter_idx - 1;
-                            if let Ok((new_lines, pages)) =
+                            if let Ok(Some((new_lines, pages, actual_page))) =
                                 Self::load_page_lines(session, prev_ch, 0)
                             {
                                 *lines = new_lines;
                                 *chapter_idx = prev_ch;
-                                *page_idx = 0;
+                                *page_idx = actual_page;
                                 *total_pages = pages;
                                 session.chapter_idx = *chapter_idx;
                                 session.page_idx = *page_idx;
@@ -716,9 +748,14 @@ impl Activity<DefaultTheme> for HomeActivity {
     }
 }
 
-#[derive(Default)]
 struct NoopSettings {
     slots: [u8; 64],
+}
+
+impl Default for NoopSettings {
+    fn default() -> Self {
+        Self { slots: [0; 64] }
+    }
 }
 
 impl SettingsStore for NoopSettings {
