@@ -139,8 +139,6 @@ impl EreaderRuntime {
         mut files: Box<dyn FileStore>,
         feed_client: Box<dyn FeedClient>,
     ) -> Self {
-        #[cfg(target_os = "espidf")]
-        epub_stream::prewarm_inflate_state_pool();
         let mut stack = ActivityStack::new();
         let theme = DefaultTheme;
         let feed_client = Rc::new(RefCell::new(feed_client));
@@ -1053,7 +1051,14 @@ impl HomeActivity {
         page_idx: usize,
         cfg: EpubLoadConfig,
     ) -> Result<Option<(Vec<String>, usize)>, String> {
-        Self::ensure_epub_chapter_capacity(session, chapter_idx)?;
+        let requires_chapter_buf = match &session.book {
+            EpubSessionBook::Generic(_) => true,
+            #[cfg(target_os = "espidf")]
+            EpubSessionBook::Temp(_) => session.chapter_buf.capacity() > 0,
+        };
+        if requires_chapter_buf {
+            Self::ensure_epub_chapter_capacity(session, chapter_idx)?;
+        }
         let chapter_opts = ChapterEventsOptions {
             render: Self::epub_render_prep_options(cfg.font_size_idx),
             max_items: Self::EPUB_MAX_CHAPTER_EVENTS,
@@ -1066,50 +1071,49 @@ impl HomeActivity {
             let mut render_session = session.engine.begin(chapter_idx, config);
             let mut target_page: Option<RenderPage> = None;
             let mut layout_error: Option<String> = None;
+            let mut on_item = |item| {
+                if layout_error.is_some() || target_page.is_some() {
+                    return Ok::<(), epub_stream::EpubError>(());
+                }
+                if let Err(err) = render_session.push(item) {
+                    layout_error = Some(err.to_string());
+                    return Ok::<(), epub_stream::EpubError>(());
+                }
+                render_session.drain_pages(|page| {
+                    if target_page.is_none() {
+                        target_page = Some(page);
+                    }
+                });
+                Ok::<(), epub_stream::EpubError>(())
+            };
             let stream_result = match &mut session.book {
-                EpubSessionBook::Generic(inner) => inner.chapter_events_with_scratch(
-                    chapter_idx,
-                    chapter_opts,
-                    &mut session.chapter_buf,
-                    &mut session.chapter_scratch,
-                    |item| {
-                        if layout_error.is_some() || target_page.is_some() {
-                            return Ok::<(), epub_stream::EpubError>(());
-                        }
-                        if let Err(err) = render_session.push(item) {
-                            layout_error = Some(err.to_string());
-                            return Ok::<(), epub_stream::EpubError>(());
-                        }
-                        render_session.drain_pages(|page| {
-                            if target_page.is_none() {
-                                target_page = Some(page);
-                            }
-                        });
-                        Ok::<(), epub_stream::EpubError>(())
-                    },
-                ),
+                EpubSessionBook::Generic(inner) => inner
+                    .chapter_events_with_scratch(
+                        chapter_idx,
+                        chapter_opts,
+                        &mut session.chapter_buf,
+                        &mut session.chapter_scratch,
+                        &mut on_item,
+                    )
+                    .map(|_| ()),
                 #[cfg(target_os = "espidf")]
-                EpubSessionBook::Temp(inner) => inner.chapter_events_with_scratch(
-                    chapter_idx,
-                    chapter_opts,
-                    &mut session.chapter_buf,
-                    &mut session.chapter_scratch,
-                    |item| {
-                        if layout_error.is_some() || target_page.is_some() {
-                            return Ok::<(), epub_stream::EpubError>(());
-                        }
-                        if let Err(err) = render_session.push(item) {
-                            layout_error = Some(err.to_string());
-                            return Ok::<(), epub_stream::EpubError>(());
-                        }
-                        render_session.drain_pages(|page| {
-                            if target_page.is_none() {
-                                target_page = Some(page);
-                            }
-                        });
-                        Ok::<(), epub_stream::EpubError>(())
-                    },
-                ),
+                EpubSessionBook::Temp(inner) => {
+                    if session.chapter_buf.capacity() == 0 {
+                        inner
+                            .chapter_events(chapter_idx, chapter_opts, &mut on_item)
+                            .map(|_| ())
+                    } else {
+                        inner
+                            .chapter_events_with_scratch(
+                                chapter_idx,
+                                chapter_opts,
+                                &mut session.chapter_buf,
+                                &mut session.chapter_scratch,
+                                &mut on_item,
+                            )
+                            .map(|_| ())
+                    }
+                }
             };
             if let Err(err) = stream_result {
                 let err_string = err.to_string();
@@ -1171,13 +1175,12 @@ impl HomeActivity {
         #[cfg(target_os = "espidf")]
         let mut chapter_buf = {
             let mut buf = Vec::new();
-            buf.try_reserve_exact(Self::EPUB_CHAPTER_BUF_CAPACITY_BYTES)
-                .map_err(|_| {
-                    format!(
-                        "Unable to allocate EPUB chapter buffer ({} bytes)",
-                        Self::EPUB_CHAPTER_BUF_CAPACITY_BYTES
-                    )
-                })?;
+            if buf
+                .try_reserve_exact(Self::EPUB_CHAPTER_BUF_CAPACITY_BYTES)
+                .is_err()
+            {
+                eprintln!("[EINKED][EPUB] chapter buffer alloc failed; using stream fallback");
+            }
             buf
         };
         #[cfg(target_os = "espidf")]
