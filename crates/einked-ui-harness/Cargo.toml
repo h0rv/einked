@@ -8,7 +8,12 @@ einked = { path = "../..", features = ["std"] }
 einked-ereader = { path = "../einked-ereader", features = ["std"] }
 
 [dev-dependencies]
+epub-stream = { path = "../../../epub-stream", package = "epub-stream", default-features = false, features = ["std"] }
 font8x8 = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+[[bin]]
+name = "ui-heap-profile"
+path = "src/bin/ui_heap_profile.rs"
 
 [workspace]

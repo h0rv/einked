@@ -139,6 +139,8 @@ impl EreaderRuntime {
         mut files: Box<dyn FileStore>,
         feed_client: Box<dyn FeedClient>,
     ) -> Self {
+        #[cfg(target_os = "espidf")]
+        epub_stream::prewarm_inflate_state_pool();
         let mut stack = ActivityStack::new();
         let theme = DefaultTheme;
         let feed_client = Rc::new(RefCell::new(feed_client));
@@ -243,13 +245,13 @@ impl Ui<DefaultTheme> for RuntimeUi<'_> {
 }
 
 struct NoopSettings {
-    slots: [u8; 32],
+    slots: [u8; 256],
 }
 
 impl Default for NoopSettings {
     fn default() -> Self {
         Self {
-            slots: [u8::MAX; 32],
+            slots: [u8::MAX; 256],
         }
     }
 }
@@ -422,18 +424,18 @@ struct HomeActivity {
     epub_display_width: i32,
     epub_display_height: i32,
     #[cfg(feature = "std")]
-    epub_session: Option<EpubSession>,
+    epub_session: Option<Box<EpubSession>>,
     feed_client: Rc<RefCell<Box<dyn FeedClient>>>,
     modal: ModalState,
 }
 
 impl HomeActivity {
     #[cfg(target_os = "espidf")]
-    const EPUB_PAGE_WINDOW: usize = 2;
+    const EPUB_PAGE_WINDOW: usize = 1;
     #[cfg(not(target_os = "espidf"))]
     const EPUB_PAGE_WINDOW: usize = 6;
     #[cfg(target_os = "espidf")]
-    const EPUB_MAX_CHAPTER_EVENTS: usize = 16_384;
+    const EPUB_MAX_CHAPTER_EVENTS: usize = 8_192;
     #[cfg(not(target_os = "espidf"))]
     const EPUB_MAX_CHAPTER_EVENTS: usize = 65_536;
     #[cfg(target_os = "espidf")]
@@ -920,7 +922,7 @@ impl HomeActivity {
                     max_css_bytes: 16 * 1024,
                     max_nav_bytes: 32 * 1024,
                     max_inline_style_bytes: 1024,
-                    max_pages_in_memory: 4,
+                    max_pages_in_memory: 1,
                 },
             }
         } else {
@@ -1165,9 +1167,22 @@ impl HomeActivity {
         path: &str,
         cfg: EpubLoadConfig,
         ctx: &mut Context<'_, DefaultTheme>,
-    ) -> Result<EpubSession, String> {
+    ) -> Result<Box<EpubSession>, String> {
+        #[cfg(target_os = "espidf")]
+        let mut chapter_buf = {
+            let mut buf = Vec::new();
+            buf.try_reserve_exact(Self::EPUB_CHAPTER_BUF_CAPACITY_BYTES)
+                .map_err(|_| {
+                    format!(
+                        "Unable to allocate EPUB chapter buffer ({} bytes)",
+                        Self::EPUB_CHAPTER_BUF_CAPACITY_BYTES
+                    )
+                })?;
+            buf
+        };
         #[cfg(target_os = "espidf")]
         let book = {
+            eprintln!("[EINKED][EPUB] open_with_temp_storage begin");
             let options = EpubBookOptions {
                 zip_limits: Some(ZipLimits::new(256 * 1024, 128)),
                 validation_mode: ValidationMode::Lenient,
@@ -1193,6 +1208,8 @@ impl HomeActivity {
                 .map_err(|err| format!("Failed to parse EPUB: {}", err))?,
             )
         };
+        #[cfg(target_os = "espidf")]
+        eprintln!("[EINKED][EPUB] open_with_temp_storage done");
         #[cfg(not(target_os = "espidf"))]
         let book = {
             let reader = ctx
@@ -1214,12 +1231,12 @@ impl HomeActivity {
             cfg.display_width,
             cfg.display_height,
         );
-        Ok(EpubSession {
+        Ok(Box::new(EpubSession {
             book,
             engine,
             font_family_idx: cfg.font_family_idx,
             #[cfg(target_os = "espidf")]
-            chapter_buf: Vec::new(),
+            chapter_buf: core::mem::take(&mut chapter_buf),
             #[cfg(not(target_os = "espidf"))]
             chapter_buf: Vec::with_capacity(Self::EPUB_CHAPTER_BUF_CAPACITY_BYTES),
             #[cfg(target_os = "espidf")]
@@ -1230,7 +1247,7 @@ impl HomeActivity {
             },
             #[cfg(not(target_os = "espidf"))]
             chapter_scratch: ScratchBuffers::embedded(),
-        })
+        }))
     }
 
     #[cfg(feature = "std")]
@@ -1318,6 +1335,7 @@ impl HomeActivity {
         }
     }
 
+    #[inline(never)]
     fn open_epub_in_reader(&mut self, path: &str, ctx: &mut Context<'_, DefaultTheme>) {
         #[cfg(target_os = "espidf")]
         eprintln!("[EINKED][EPUB] open start path={}", path);
@@ -1327,12 +1345,12 @@ impl HomeActivity {
         }
         #[cfg(target_os = "espidf")]
         {
-            // Drop list allocations before EPUB open to improve contiguous heap headroom.
-            self.files.clear();
-            self.files.shrink_to_fit();
-            // These are static source descriptors; reclaim their heap while reader is active.
-            self.feed_sources.clear();
-            self.feed_sources.shrink_to_fit();
+            eprintln!("[EINKED][EPUB] releasing list buffers");
+            // Avoid shrink_to_fit here: it may trigger realloc under pressure.
+            let _ = core::mem::take(&mut self.files);
+            // These are static source descriptors; drop their buffers while reader is active.
+            let _ = core::mem::take(&mut self.feed_sources);
+            eprintln!("[EINKED][EPUB] list buffers released");
         }
         let cfg = EpubLoadConfig {
             font_size_idx: self.font_size_idx,
@@ -1411,6 +1429,7 @@ impl HomeActivity {
             || lower.ends_with(b".EPU")
     }
 
+    #[inline(never)]
     fn open_file_in_reader(&mut self, path: &str, ctx: &mut Context<'_, DefaultTheme>) {
         #[cfg(target_os = "espidf")]
         eprintln!("[EINKED][OPEN] file path={}", path);
@@ -2467,8 +2486,8 @@ mod tests {
         );
         let mut settings = NoopSettings::default();
         let mut files = NoopFiles;
-        let mut ctx = test_ctx(&mut settings, &mut files);
         settings.save_raw(HomeActivity::SETTING_KEY_WIFI_ACTIVE, &[1]);
+        let mut ctx = test_ctx(&mut settings, &mut files);
         act.on_enter(&mut ctx);
 
         let _ = act.on_input(InputEvent::Press(Button::Right), &mut ctx);
