@@ -27,6 +27,10 @@ use std::fs::File;
 use epub_stream::book::ChapterEventsOptions;
 #[cfg(all(feature = "std", target_os = "espidf"))]
 use epub_stream::book::OpenConfig;
+#[cfg(all(feature = "std", target_os = "espidf"))]
+use epub_stream::metadata::MetadataLimits;
+#[cfg(all(feature = "std", target_os = "espidf"))]
+use epub_stream::navigation::NavigationLimits;
 #[cfg(feature = "std")]
 use epub_stream::{
     EpubBook, FontLimits, LayoutHints, MemoryBudget, RenderPrepOptions, ScratchBuffers,
@@ -882,27 +886,35 @@ impl HomeActivity {
         opts.layout.typography.justification.enabled = false;
         opts.layout.typography.justification.strategy = JustificationStrategy::AlignLeft;
         opts.layout.typography.hyphenation.soft_hyphen_policy = HyphenationMode::Discretionary;
-        opts.prep.layout_hints.base_font_size_px = Self::epub_base_font_px(font_size_idx);
-        opts.prep.layout_hints.text_scale = 1.0;
-        opts.prep.layout_hints.min_line_height = 1.05;
-        opts.prep.layout_hints.max_line_height = 1.25;
-        opts.prep.style.hints = opts.prep.layout_hints;
+        opts.prep = Self::epub_render_prep_options(font_size_idx);
+        RenderEngine::new(opts)
+    }
+
+    #[cfg(feature = "std")]
+    fn epub_render_prep_options(font_size_idx: usize) -> RenderPrepOptions {
+        let hints = LayoutHints {
+            base_font_size_px: Self::epub_base_font_px(font_size_idx),
+            text_scale: 1.0,
+            min_line_height: 1.05,
+            max_line_height: 1.25,
+            ..LayoutHints::default()
+        };
         if cfg!(target_os = "espidf") {
-            opts.prep = RenderPrepOptions {
+            RenderPrepOptions {
                 style: StyleConfig {
                     limits: StyleLimits {
                         max_selectors: 128,
                         max_css_bytes: 16 * 1024,
                         max_nesting: 8,
                     },
-                    hints: LayoutHints::default(),
+                    hints,
                 },
                 fonts: FontLimits {
                     max_faces: 2,
                     max_bytes_per_font: 48 * 1024,
                     max_total_font_bytes: 96 * 1024,
                 },
-                layout_hints: opts.prep.layout_hints,
+                layout_hints: hints,
                 memory: MemoryBudget {
                     max_entry_bytes: 64 * 1024,
                     max_css_bytes: 16 * 1024,
@@ -910,9 +922,18 @@ impl HomeActivity {
                     max_inline_style_bytes: 1024,
                     max_pages_in_memory: 4,
                 },
-            };
+            }
+        } else {
+            RenderPrepOptions {
+                style: StyleConfig {
+                    limits: StyleLimits::default(),
+                    hints,
+                },
+                fonts: FontLimits::default(),
+                layout_hints: hints,
+                memory: MemoryBudget::default(),
+            }
         }
-        RenderEngine::new(opts)
     }
 
     #[cfg(feature = "std")]
@@ -1032,8 +1053,8 @@ impl HomeActivity {
     ) -> Result<Option<(Vec<String>, usize)>, String> {
         Self::ensure_epub_chapter_capacity(session, chapter_idx)?;
         let chapter_opts = ChapterEventsOptions {
+            render: Self::epub_render_prep_options(cfg.font_size_idx),
             max_items: Self::EPUB_MAX_CHAPTER_EVENTS,
-            ..ChapterEventsOptions::default()
         };
         let mut grow_retries = 0usize;
         loop {
@@ -1151,6 +1172,8 @@ impl HomeActivity {
                 zip_limits: Some(ZipLimits::new(256 * 1024, 128)),
                 validation_mode: ValidationMode::Lenient,
                 max_nav_bytes: Some(32 * 1024),
+                navigation_limits: NavigationLimits::embedded(),
+                metadata_limits: MetadataLimits::embedded(),
             };
             let native_path = ctx
                 .files

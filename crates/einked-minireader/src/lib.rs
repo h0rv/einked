@@ -20,6 +20,10 @@ use einked::ui::runtime::UiRuntime;
 #[cfg(feature = "std")]
 use epub_stream::book::{ChapterEventsOptions, OpenConfig};
 #[cfg(feature = "std")]
+use epub_stream::metadata::MetadataLimits;
+#[cfg(feature = "std")]
+use epub_stream::navigation::NavigationLimits;
+#[cfg(feature = "std")]
 use epub_stream::{EpubBook, EpubBookOptions, ScratchBuffers, ValidationMode, ZipLimits};
 #[cfg(feature = "std")]
 use epub_stream_render::{
@@ -199,6 +203,9 @@ struct ReaderSession {
     page_idx: usize,
 }
 
+#[cfg(feature = "std")]
+type ReadablePage = (usize, usize, usize, Vec<String>);
+
 struct HomeActivity {
     screen: Rect,
     battery_key: u8,
@@ -337,6 +344,8 @@ impl HomeActivity {
                 ),
                 validation_mode: ValidationMode::Lenient,
                 max_nav_bytes: Some(Self::MAX_NAV_BYTES),
+                navigation_limits: NavigationLimits::embedded(),
+                metadata_limits: MetadataLimits::embedded(),
             },
             lazy_navigation: true,
         };
@@ -427,7 +436,7 @@ impl HomeActivity {
         chapter_count: usize,
         start_chapter_idx: usize,
         start_page_idx: usize,
-    ) -> Result<Option<(usize, usize, usize, Vec<String>)>, String> {
+    ) -> Result<Option<ReadablePage>, String> {
         for chapter_idx in start_chapter_idx..chapter_count {
             let page_idx = if chapter_idx == start_chapter_idx {
                 start_page_idx
