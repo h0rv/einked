@@ -6,6 +6,7 @@ edition = "2024"
 [features]
 default = ["std"]
 std = ["einked/std", "dep:epub-stream", "dep:epub-stream-render", "dep:epub-stream-embedded-graphics"]
+reader-only = []
 
 [dependencies]
 einked = { path = "../..", features = ["alloc"] }

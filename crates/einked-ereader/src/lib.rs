@@ -29,6 +29,8 @@ use std::hash::{Hash, Hasher};
 #[cfg(feature = "std")]
 use std::path::{Path, PathBuf};
 #[cfg(feature = "std")]
+use std::sync::{Mutex, OnceLock};
+#[cfg(feature = "std")]
 use std::time::UNIX_EPOCH;
 
 #[cfg(feature = "std")]
@@ -58,6 +60,9 @@ pub mod embedded_fonts;
 pub mod feed;
 pub mod feed_browser;
 
+#[cfg(feature = "std")]
+static DEBUG_SNAPSHOT: OnceLock<Mutex<String>> = OnceLock::new();
+
 pub use embedded_fonts::{
     BOOKERLY_BOLD, BOOKERLY_BOLD_ITALIC, BOOKERLY_ITALIC, BOOKERLY_REGULAR, BOOKERLY_SET,
     EmbeddedFont,
@@ -68,6 +73,24 @@ pub use feed::{
     default_feed_client, get_reader_url,
 };
 pub use feed_browser::{BrowserState, FeedBrowserActivity};
+
+#[cfg(feature = "std")]
+fn publish_debug_snapshot(snapshot: String) {
+    let slot = DEBUG_SNAPSHOT.get_or_init(|| Mutex::new(String::new()));
+    if let Ok(mut guard) = slot.lock() {
+        *guard = snapshot;
+    }
+}
+
+#[cfg(feature = "std")]
+pub fn debug_snapshot() -> String {
+    let slot = DEBUG_SNAPSHOT.get_or_init(|| Mutex::new(String::new()));
+    match slot.lock() {
+        Ok(guard) if !guard.is_empty() => guard.clone(),
+        Ok(_) => "runtime=ereader snapshot=uninitialized".to_string(),
+        Err(_) => "runtime=ereader snapshot=poisoned".to_string(),
+    }
+}
 
 pub trait FrameSink {
     fn render_and_flush(&mut self, cmds: &[DrawCmd<'static>], hint: RefreshHint) -> bool;
@@ -631,10 +654,7 @@ impl HomeActivity {
     const EPUB_MAX_CHAPTER_CACHE_BYTES: usize = 512 * 1024;
     #[cfg(not(target_os = "espidf"))]
     const EPUB_MAX_CHAPTER_CACHE_BYTES: usize = 4 * 1024 * 1024;
-    #[cfg(target_os = "espidf")]
-    const READER_FIRST_MODE: bool = true;
-    #[cfg(not(target_os = "espidf"))]
-    const READER_FIRST_MODE: bool = false;
+    const READER_FIRST_MODE: bool = cfg!(feature = "reader-only");
 
     #[cfg(test)]
     fn new_with_device_and_feed(
@@ -681,6 +701,8 @@ impl HomeActivity {
         #[cfg(feature = "std")]
         boot_probe(probe, "home_activity:epub_resources_deferred");
         boot_probe(probe, "home_activity:ready");
+        #[cfg(feature = "std")]
+        activity.refresh_debug_snapshot();
         activity
     }
 
@@ -707,6 +729,7 @@ impl HomeActivity {
         if let Some(session) = self.epub_session.take() {
             self.epub_resources = session.into_resources();
         }
+        self.refresh_debug_snapshot();
     }
 
     #[cfg(feature = "std")]
@@ -730,6 +753,48 @@ impl HomeActivity {
 
     fn transfer_ui_enabled() -> bool {
         !Self::READER_FIRST_MODE
+    }
+
+    #[cfg(feature = "std")]
+    fn modal_label(&self) -> &'static str {
+        match self.modal {
+            ModalState::None => "none",
+            ModalState::Transfer => "transfer",
+            ModalState::Reader { .. } => "reader",
+            ModalState::EpubReader => "epub_reader",
+            ModalState::FeedEntries { .. } => "feed_entries",
+            ModalState::FeedItem { .. } => "feed_item",
+            ModalState::FeedArticle { .. } => "feed_article",
+            ModalState::FeedOffline { .. } => "feed_offline",
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn refresh_debug_snapshot(&self) {
+        let mut snapshot = format!(
+            "tab={:?} modal={} reader_only={} files={} feeds={} ",
+            self.tab,
+            self.modal_label(),
+            Self::READER_FIRST_MODE,
+            self.files.len(),
+            self.feed_sources.len()
+        );
+        if let Some(session) = self.epub_session.as_ref() {
+            snapshot.push_str(&format!(
+                "epub_session=1 chapter={}/{} page={}/{} pending={:?} bitmap={} fallback_lines={} images_enabled={}",
+                session.reader.chapter_idx + 1,
+                session.reader.chapter_count.max(1),
+                session.reader.page_idx + 1,
+                session.reader.total_pages.max(1),
+                session.reader.pending_action,
+                session.resources.page_bitmap.is_some(),
+                session.resources.page_fallback_lines.len(),
+                session.images_enabled(),
+            ));
+        } else {
+            snapshot.push_str("epub_session=0");
+        }
+        publish_debug_snapshot(snapshot);
     }
 
     fn next_tab(&self) -> MainTab {
@@ -1846,6 +1911,7 @@ impl HomeActivity {
             return;
         };
         session.schedule_pending_action(EpubPendingAction::Nav(action));
+        self.refresh_debug_snapshot();
     }
 
     #[cfg(feature = "std")]
@@ -2064,6 +2130,7 @@ impl HomeActivity {
             EpubOpenOutcome::Opened(session) => {
                 self.epub_session = Some(session);
                 self.modal = ModalState::EpubReader;
+                self.refresh_debug_snapshot();
             }
             EpubOpenOutcome::Failed { resources, message } => {
                 self.epub_resources = resources;
@@ -2072,6 +2139,7 @@ impl HomeActivity {
                     lines: vec![message],
                     scroll: 0,
                 };
+                self.refresh_debug_snapshot();
             }
         }
     }
@@ -2477,6 +2545,8 @@ impl Activity<DefaultTheme> for HomeActivity {
     fn on_enter(&mut self, ctx: &mut Context<'_, DefaultTheme>) {
         self.load_settings(ctx);
         self.refresh_files(ctx);
+        #[cfg(feature = "std")]
+        self.refresh_debug_snapshot();
     }
 
     fn on_input(
@@ -2858,11 +2928,13 @@ impl Activity<DefaultTheme> for HomeActivity {
                 match Self::process_pending_epub_action(session, ctx, action) {
                     Ok(session) => {
                         self.epub_session = Some(session);
+                        self.refresh_debug_snapshot();
                     }
                     Err((session, _message)) => {
                         self.epub_session = Some(session);
                         #[cfg(target_os = "espidf")]
                         eprintln!("[EPUB] pending action failed");
+                        self.refresh_debug_snapshot();
                     }
                 }
             }
