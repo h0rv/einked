@@ -544,7 +544,7 @@ enum EpubSessionSource {
 
 #[cfg(feature = "std")]
 struct EpubTransientWorker {
-    book: Box<EpubSessionBook>,
+    book: EpubSessionBook,
     engine: Box<RenderEngine>,
 }
 
@@ -1252,21 +1252,18 @@ impl HomeActivity {
     }
 
     #[cfg(feature = "std")]
-    fn worker_from_open_book(
-        session: &EpubSession,
-        book: EpubSessionBook,
-    ) -> Box<EpubTransientWorker> {
-        Box::new(EpubTransientWorker {
-            book: Box::new(book),
+    fn worker_from_open_book(session: &EpubSession, book: EpubSessionBook) -> EpubTransientWorker {
+        EpubTransientWorker {
+            book,
             engine: Box::new(Self::transient_engine_for_session(session)),
-        })
+        }
     }
 
     #[cfg(feature = "std")]
     fn transient_worker_for_session(
         session: &EpubSession,
         ctx: &mut Context<'_, DefaultTheme>,
-    ) -> Result<Box<EpubTransientWorker>, String> {
+    ) -> Result<EpubTransientWorker, String> {
         let book = Self::transient_book_for_session(session, ctx)?;
         Ok(Self::worker_from_open_book(session, book))
     }
@@ -1304,7 +1301,7 @@ impl HomeActivity {
         if let Some(cache) = cache {
             config = config.with_cache(cache);
         }
-        match worker.book.as_mut() {
+        match &mut worker.book {
             #[cfg(not(target_os = "espidf"))]
             EpubSessionBook::Generic(inner) => worker
                 .engine
@@ -1335,7 +1332,7 @@ impl HomeActivity {
             ..Default::default()
         };
         let renderer = EgRenderer::with_backend(cfg, MonoFontBackend);
-        let diagnostics = match worker.book.as_mut() {
+        let diagnostics = match &mut worker.book {
             #[cfg(not(target_os = "espidf"))]
             EpubSessionBook::Generic(inner) => renderer.render_page_with_streamed_images(
                 inner,
@@ -1437,8 +1434,8 @@ impl HomeActivity {
         resources: &mut EpubResources,
         cfg: EpubLoadConfig,
         ctx: &mut Context<'_, DefaultTheme>,
-    ) -> Result<(Box<EpubSession>, Box<EpubTransientWorker>), String> {
-        let (source, chapter_count, book) = {
+    ) -> Result<Box<EpubSession>, String> {
+        let (source, chapter_count) = {
             if let Some(native_path) = ctx.files.native_path(path) {
                 epub_mark!("session_open_temp_begin");
                 let book = Self::open_temp_backed_epub_book(&native_path)?;
@@ -1446,7 +1443,6 @@ impl HomeActivity {
                 (
                     EpubSessionSource::NativePath(native_path),
                     book.chapter_count(),
-                    EpubSessionBook::Temp(book),
                 )
             } else {
                 #[cfg(target_os = "espidf")]
@@ -1470,7 +1466,6 @@ impl HomeActivity {
                     (
                         EpubSessionSource::VirtualPath(path.to_string()),
                         book.chapter_count(),
-                        EpubSessionBook::Generic(book),
                     )
                 }
             }
@@ -1492,8 +1487,7 @@ impl HomeActivity {
             cache_root,
         });
         epub_mark!("session_box_ready");
-        let worker = Self::worker_from_open_book(&session, book);
-        Ok((session, worker))
+        Ok(session)
     }
 
     #[cfg(all(feature = "std", target_os = "espidf"))]
@@ -1501,7 +1495,7 @@ impl HomeActivity {
         native_path: String,
         resources: EpubResources,
         cfg: EpubLoadConfig,
-    ) -> Result<(Box<EpubSession>, Box<EpubTransientWorker>), (EpubResources, String)> {
+    ) -> Result<Box<EpubSession>, (EpubResources, String)> {
         epub_mark!("session_open_temp_begin");
         let book = match Self::open_temp_backed_epub_book(&native_path) {
             Ok(book) => book,
@@ -1526,18 +1520,18 @@ impl HomeActivity {
             cache_root,
         });
         epub_mark!("session_box_ready");
-        let worker = Self::worker_from_open_book(&session, EpubSessionBook::Temp(book));
-        Ok((session, worker))
+        Ok(session)
     }
 
     #[cfg(feature = "std")]
     #[inline(never)]
     fn initialize_epub_session(
         mut session: Box<EpubSession>,
-        worker: &mut EpubTransientWorker,
+        ctx: &mut Context<'_, DefaultTheme>,
+        cfg: EpubLoadConfig,
     ) -> Result<Box<EpubSession>, (Box<EpubSession>, String)> {
         epub_mark!("session_init_begin");
-        match Self::find_readable_epub_chapter_with_worker(&mut session, worker, 0, 1) {
+        match Self::find_readable_epub_chapter(&mut session, ctx, 0, 1, cfg) {
             Some((chapter_idx, total_pages)) => {
                 let chapter_count = session.chapter_count;
                 session.set_reader_position(chapter_idx, chapter_count, total_pages, 0);
@@ -1872,42 +1866,32 @@ impl HomeActivity {
             };
             let resources = core::mem::take(&mut self.epub_resources);
             match Self::open_epub_session_from_native_path(native_path, resources, cfg) {
-                Ok((session, mut worker)) => {
-                    match Self::initialize_epub_session(session, &mut worker) {
-                        Ok(mut session) => {
-                            let _ = Self::refresh_epub_page_bitmap_with_worker(
-                                &mut session,
-                                &mut worker,
-                            );
-                            EpubOpenOutcome::Opened(session)
-                        }
-                        Err((session, message)) => EpubOpenOutcome::Failed {
-                            resources: session.into_resources(),
-                            message,
-                        },
+                Ok(session) => match Self::initialize_epub_session(session, ctx, cfg) {
+                    Ok(mut session) => {
+                        let _ = Self::refresh_epub_page_bitmap(&mut session, ctx);
+                        EpubOpenOutcome::Opened(session)
                     }
-                }
+                    Err((session, message)) => EpubOpenOutcome::Failed {
+                        resources: session.into_resources(),
+                        message,
+                    },
+                },
                 Err((resources, message)) => EpubOpenOutcome::Failed { resources, message },
             }
         };
         #[cfg(all(feature = "std", not(target_os = "espidf")))]
         let open_outcome = {
             match Self::open_epub_session(path, &mut self.epub_resources, cfg, ctx) {
-                Ok((session, mut worker)) => {
-                    match Self::initialize_epub_session(session, &mut worker) {
-                        Ok(mut session) => {
-                            let _ = Self::refresh_epub_page_bitmap_with_worker(
-                                &mut session,
-                                &mut worker,
-                            );
-                            EpubOpenOutcome::Opened(session)
-                        }
-                        Err((session, message)) => EpubOpenOutcome::Failed {
-                            resources: session.into_resources(),
-                            message,
-                        },
+                Ok(session) => match Self::initialize_epub_session(session, ctx, cfg) {
+                    Ok(mut session) => {
+                        let _ = Self::refresh_epub_page_bitmap(&mut session, ctx);
+                        EpubOpenOutcome::Opened(session)
                     }
-                }
+                    Err((session, message)) => EpubOpenOutcome::Failed {
+                        resources: session.into_resources(),
+                        message,
+                    },
+                },
                 Err(message) => EpubOpenOutcome::Failed {
                     resources: core::mem::take(&mut self.epub_resources),
                     message,
