@@ -50,8 +50,8 @@ use epub_stream_embedded_graphics::{
 };
 #[cfg(feature = "std")]
 use epub_stream_render::{
-    FileRenderCacheStore, HyphenationMode, JustificationStrategy, RenderCacheStore, RenderConfig,
-    RenderEngine, RenderEngineOptions, RenderPage,
+    DrawCommand, FileRenderCacheStore, HyphenationMode, JustificationStrategy, RenderCacheStore,
+    RenderConfig, RenderEngine, RenderEngineOptions, RenderPage,
 };
 
 pub mod embedded_fonts;
@@ -429,7 +429,7 @@ enum ModalState {
 }
 
 #[cfg(feature = "std")]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EpubNavAction {
     PrevPage,
     NextPage,
@@ -507,6 +507,14 @@ impl EpubPageBitmap {
 #[derive(Default)]
 struct EpubResources {
     page_bitmap: Option<EpubPageBitmap>,
+    page_fallback_lines: Vec<String>,
+}
+
+#[cfg(feature = "std")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EpubPendingAction {
+    RefreshCurrent,
+    Nav(EpubNavAction),
 }
 
 #[cfg(feature = "std")]
@@ -516,6 +524,7 @@ struct EpubReaderState {
     chapter_count: usize,
     total_pages: usize,
     page_idx: usize,
+    pending_action: Option<EpubPendingAction>,
 }
 
 #[cfg(feature = "std")]
@@ -554,6 +563,7 @@ impl EpubSession {
         if let Some(bitmap) = self.resources.page_bitmap.as_mut() {
             bitmap.clear();
         }
+        self.resources.page_fallback_lines.clear();
         self.resources
     }
 
@@ -568,14 +578,20 @@ impl EpubSession {
         self.reader.chapter_count = chapter_count;
         self.reader.total_pages = total_pages.max(1);
         self.reader.page_idx = page_idx.min(self.reader.total_pages.saturating_sub(1));
+        self.reader.pending_action = None;
         if let Some(bitmap) = self.resources.page_bitmap.as_mut() {
             bitmap.clear();
             bitmap.next_generation();
         }
+        self.resources.page_fallback_lines.clear();
     }
 
     fn font_family_idx(&self) -> usize {
         self.load_cfg.font_family_idx
+    }
+
+    fn schedule_pending_action(&mut self, action: EpubPendingAction) {
+        self.reader.pending_action = Some(action);
     }
 }
 
@@ -1539,6 +1555,7 @@ impl HomeActivity {
             session.reader.chapter_count,
             session.reader.total_pages
         );
+        session.schedule_pending_action(EpubPendingAction::RefreshCurrent);
         epub_mark!("session_init_ready");
         Ok(session)
     }
@@ -1571,6 +1588,65 @@ impl HomeActivity {
     }
 
     #[cfg(feature = "std")]
+    fn render_page_fallback_lines(page: &RenderPage) -> Vec<String> {
+        const MAX_RAW_LINES: usize = 36;
+        let mut raw_lines = Vec::new();
+        let mut current_baseline: Option<i32> = None;
+        let mut current_line = String::new();
+
+        let flush_line = |current_line: &mut String, raw_lines: &mut Vec<String>| {
+            if !current_line.trim().is_empty() {
+                raw_lines.push(current_line.trim().to_string());
+                current_line.clear();
+            }
+        };
+
+        for command in page.merged_commands_iter() {
+            match command {
+                DrawCommand::Text(cmd) => {
+                    let text = cmd.text.trim();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    match current_baseline {
+                        Some(baseline) if (cmd.baseline_y - baseline).abs() > 6 => {
+                            flush_line(&mut current_line, &mut raw_lines);
+                            current_baseline = Some(cmd.baseline_y);
+                        }
+                        None => current_baseline = Some(cmd.baseline_y),
+                        _ => {}
+                    }
+                    if !current_line.is_empty() {
+                        current_line.push(' ');
+                    }
+                    current_line.push_str(text);
+                }
+                DrawCommand::ImageObject(image) => {
+                    flush_line(&mut current_line, &mut raw_lines);
+                    let label = image.alt.trim();
+                    if label.is_empty() {
+                        raw_lines.push("[Image]".to_string());
+                    } else {
+                        raw_lines.push(format!("[Image: {}]", label));
+                    }
+                    current_baseline = None;
+                }
+                _ => {}
+            }
+            if raw_lines.len() >= MAX_RAW_LINES {
+                break;
+            }
+        }
+        flush_line(&mut current_line, &mut raw_lines);
+        if raw_lines.is_empty() {
+            raw_lines.push("Page contains no text fallback content.".to_string());
+        }
+        let mut wrapped = Self::wrap_reader_lines(raw_lines);
+        wrapped.truncate(40);
+        wrapped
+    }
+
+    #[cfg(feature = "std")]
     fn find_readable_epub_chapter(
         session: &mut EpubSession,
         ctx: &mut Context<'_, DefaultTheme>,
@@ -1583,32 +1659,6 @@ impl HomeActivity {
         while idx >= 0 && (idx as usize) < chapter_count {
             if let Ok(Some((_page, total_pages))) =
                 Self::load_epub_page(session, ctx, idx as usize, 0, cfg)
-            {
-                epub_trace!(
-                    "chapter_probe_ready chapter={} total_pages={}",
-                    idx as usize,
-                    total_pages
-                );
-                return Some((idx as usize, total_pages.max(1)));
-            }
-            idx += step;
-        }
-        None
-    }
-
-    #[cfg(feature = "std")]
-    #[inline(never)]
-    fn find_readable_epub_chapter_with_worker(
-        session: &mut EpubSession,
-        worker: &mut EpubTransientWorker,
-        chapter_idx: usize,
-        step: isize,
-    ) -> Option<(usize, usize)> {
-        let chapter_count = session.chapter_count;
-        let mut idx = chapter_idx as isize;
-        while idx >= 0 && (idx as usize) < chapter_count {
-            if let Ok(Some((_page, total_pages))) =
-                Self::load_epub_page_with_worker(session, worker, idx as usize, 0)
             {
                 epub_trace!(
                     "chapter_probe_ready chapter={} total_pages={}",
@@ -1703,27 +1753,14 @@ impl HomeActivity {
     #[cfg(feature = "std")]
     fn run_epub_nav_action(
         &mut self,
-        ctx: &mut Context<'_, DefaultTheme>,
+        _ctx: &mut Context<'_, DefaultTheme>,
         action: EpubNavAction,
-        cfg: EpubLoadConfig,
+        _cfg: EpubLoadConfig,
     ) {
-        let Some(session) = self.epub_session.take() else {
+        let Some(session) = self.epub_session.as_mut() else {
             return;
         };
-        let result = Ok(Self::apply_epub_nav_to_session(session, ctx, action, cfg));
-        match result {
-            Ok(mut session) => {
-                let _ = Self::refresh_epub_page_bitmap(&mut session, ctx);
-                self.epub_session = Some(session);
-            }
-            Err(message) => {
-                self.modal = ModalState::Reader {
-                    title: "EPUB".to_string(),
-                    lines: vec![message],
-                    scroll: 0,
-                };
-            }
-        }
+        session.schedule_pending_action(EpubPendingAction::Nav(action));
     }
 
     #[cfg(feature = "std")]
@@ -1765,6 +1802,10 @@ impl HomeActivity {
             session.reader.page_idx,
         )?
         else {
+            session.resources.page_fallback_lines = vec![
+                "Page unavailable.".to_string(),
+                "No readable page content.".to_string(),
+            ];
             return Ok(());
         };
         session.reader.total_pages = total_pages.max(1);
@@ -1774,9 +1815,14 @@ impl HomeActivity {
             session.reader.page_idx,
             session.reader.total_pages
         );
+        if session.resources.page_bitmap.is_none() {
+            session.resources.page_fallback_lines = Self::render_page_fallback_lines(&page);
+            return Ok(());
+        }
         let Some(bitmap) = session.resources.page_bitmap.as_mut() else {
             return Ok(());
         };
+        session.resources.page_fallback_lines.clear();
         bitmap.clear();
         let mut framebuffer =
             PackedBinaryFrameBuffer::new(bitmap.width, bitmap.height, bitmap.bytes_mut())
@@ -1808,6 +1854,48 @@ impl HomeActivity {
         );
         epub_mark!("page_bitmap_refresh_ready");
         Ok(())
+    }
+
+    #[cfg(feature = "std")]
+    fn process_pending_epub_action(
+        mut session: Box<EpubSession>,
+        ctx: &mut Context<'_, DefaultTheme>,
+        action: EpubPendingAction,
+    ) -> Result<Box<EpubSession>, (Box<EpubSession>, String)> {
+        epub_trace!(
+            "pending_begin action={:?} chapter={} page={} total_pages={}",
+            action,
+            session.reader.chapter_idx,
+            session.reader.page_idx,
+            session.reader.total_pages
+        );
+        let result = match action {
+            EpubPendingAction::RefreshCurrent => Self::refresh_epub_page_bitmap(&mut session, ctx),
+            EpubPendingAction::Nav(nav) => {
+                let cfg = session.load_cfg;
+                session = Self::apply_epub_nav_to_session(session, ctx, nav, cfg);
+                Self::refresh_epub_page_bitmap(&mut session, ctx)
+            }
+        };
+        match result {
+            Ok(()) => {
+                epub_trace!(
+                    "pending_ready action={:?} chapter={} page={} total_pages={}",
+                    action,
+                    session.reader.chapter_idx,
+                    session.reader.page_idx,
+                    session.reader.total_pages
+                );
+                Ok(session)
+            }
+            Err(message) => {
+                session.resources.page_fallback_lines = Self::wrap_reader_lines(vec![
+                    message.clone(),
+                    "Reader stays alive; retrying page load is safe.".to_string(),
+                ]);
+                Err((session, message))
+            }
+        }
     }
 
     #[inline(never)]
@@ -2224,6 +2312,33 @@ impl HomeActivity {
                 session.reader.chapter_idx,
                 session.reader.chapter_count,
             );
+        } else if !session.resources.page_fallback_lines.is_empty() {
+            ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "EPUB");
+            ui_ctx.draw_line(
+                Point { x: 16, y: 34 },
+                Point { x: 464, y: 34 },
+                Color::Black,
+                1,
+            );
+            ui_ctx.draw_text_at(Point { x: 16, y: 54 }, "Low-memory text mode");
+            Self::draw_reader_lines(ui_ctx, &session.resources.page_fallback_lines, 0);
+            ui_ctx.draw_text_at(
+                Point { x: 8, y: 794 },
+                &format!(
+                    "ch {}/{}  p {}/{}",
+                    session.reader.chapter_idx + 1,
+                    session.reader.chapter_count.max(1),
+                    session.reader.page_idx + 1,
+                    session.reader.total_pages.max(1)
+                ),
+            );
+        } else if session.reader.pending_action.is_some() {
+            ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "EPUB");
+            ui_ctx.draw_text_at(Point { x: 16, y: 54 }, "Loading page...");
+            ui_ctx.draw_text_at(
+                Point { x: 16, y: 78 },
+                "Reader work is deferred to keep open/navigation stable.",
+            );
         } else {
             ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "EPUB");
             ui_ctx.draw_text_at(Point { x: 16, y: 54 }, "Page unavailable.");
@@ -2630,6 +2745,28 @@ impl Activity<DefaultTheme> for HomeActivity {
             && Self::wifi_is_active(ctx)
         {
             self.show_feed_entries_modal(source_idx);
+        }
+        #[cfg(feature = "std")]
+        if matches!(self.modal, ModalState::EpubReader) {
+            let pending_action = self
+                .epub_session
+                .as_ref()
+                .and_then(|session| session.reader.pending_action);
+            if let Some(action) = pending_action
+                && let Some(mut session) = self.epub_session.take()
+            {
+                session.reader.pending_action = None;
+                match Self::process_pending_epub_action(session, ctx, action) {
+                    Ok(session) => {
+                        self.epub_session = Some(session);
+                    }
+                    Err((session, _message)) => {
+                        self.epub_session = Some(session);
+                        #[cfg(target_os = "espidf")]
+                        eprintln!("[EPUB] pending action failed");
+                    }
+                }
+            }
         }
         Transition::Stay
     }
