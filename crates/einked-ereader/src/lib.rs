@@ -36,7 +36,7 @@ use epub_stream::navigation::NavigationLimits;
 #[cfg(feature = "std")]
 use epub_stream::{
     EpubBook, FontLimits, LayoutHints, MemoryBudget, RenderPrepOptions, ScratchBuffers,
-    StyleConfig, StyleLimits,
+    StyleConfig, StyleLimits, prewarm_inflate_state_pool,
 };
 #[cfg(all(feature = "std", target_os = "espidf"))]
 use epub_stream::{EpubBookOptions, ValidationMode, ZipLimits};
@@ -200,6 +200,11 @@ impl EreaderRuntime {
         let theme = DefaultTheme;
         let feed_client = Rc::new(RefCell::new(feed_client));
         boot_probe(probe, "ereader_runtime:after_feed_client_rc");
+        #[cfg(all(feature = "std", target_os = "espidf"))]
+        {
+            prewarm_inflate_state_pool();
+            boot_probe(probe, "ereader_runtime:after_epub_inflate_prewarm");
+        }
         let mut ctx = Context {
             theme: &theme,
             screen: config.screen,
