@@ -42,12 +42,13 @@ use epub_stream::{
 use epub_stream::{EpubBookOptions, ValidationMode, ZipLimits};
 #[cfg(feature = "std")]
 use epub_stream_embedded_graphics::{
-    EgRenderConfig, EgRenderer, MonoFontBackend, PackedBinaryFrameBuffer, StreamedImageOptions,
+    EgRenderConfig, EgRenderer, ImageFallbackPolicy, MonoFontBackend, PackedBinaryFrameBuffer,
+    StreamedImageOptions,
 };
 #[cfg(feature = "std")]
 use epub_stream_render::{
-    HyphenationMode, JustificationStrategy, RenderConfig, RenderEngine, RenderEngineOptions,
-    RenderPage,
+    DrawCommand as EpubDrawCommand, HyphenationMode, JustificationStrategy, RenderConfig,
+    RenderEngine, RenderEngineOptions, RenderPage,
 };
 
 #[cfg(feature = "std")]
@@ -675,11 +676,9 @@ impl HomeActivity {
         let page_window = Self::try_alloc_vec(Self::EPUB_PAGE_WINDOW.max(1))
             .map_err(|_| "Unable to allocate EPUB page window.".to_string())?;
         boot_probe(probe, "epub_resources:after_page_window");
-        let page_bitmap = Some(EpubPageBitmap::try_new(480, 800)?);
-        boot_probe(probe, "epub_resources:after_page_bitmap");
         let resources = EpubResources {
             page_window,
-            page_bitmap,
+            page_bitmap: None,
         };
         boot_probe(probe, "epub_resources:ready");
         Ok(resources)
@@ -687,7 +686,7 @@ impl HomeActivity {
 
     #[cfg(feature = "std")]
     fn ensure_epub_resources_ready(&mut self) -> Result<(), String> {
-        if self.epub_resources.page_bitmap.is_none() {
+        if self.epub_resources.page_window.capacity() == 0 {
             Self::log_epub_event("resource_alloc_begin");
             self.epub_resources = Self::preallocated_epub_resources()?;
             Self::log_epub_event("resource_alloc_ready");
@@ -1518,6 +1517,32 @@ impl HomeActivity {
     }
 
     #[cfg(feature = "std")]
+    fn ensure_epub_page_bitmap(session: &mut EpubSession) {
+        if session.resources.page_bitmap.is_some() {
+            return;
+        }
+        Self::log_epub_event("page_bitmap_alloc_begin");
+        match EpubPageBitmap::try_new(480, 800) {
+            Ok(bitmap) => {
+                session.resources.page_bitmap = Some(bitmap);
+                Self::log_epub_event("page_bitmap_alloc_ready");
+            }
+            Err(err) => {
+                Self::log_epub_event(&format!("page_bitmap_alloc_skipped reason={}", err));
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn current_epub_page(session: &EpubSession) -> Option<&RenderPage> {
+        let local_idx = session
+            .reader
+            .page_idx
+            .saturating_sub(session.reader.page_window_start);
+        session.resources.page_window.get(local_idx)
+    }
+
+    #[cfg(feature = "std")]
     fn load_epub_chapter_in_direction(
         session: &mut EpubSession,
         chapter_idx: usize,
@@ -1603,45 +1628,54 @@ impl HomeActivity {
 
     #[cfg(feature = "std")]
     fn refresh_epub_page_bitmap(session: &mut EpubSession) -> Result<(), String> {
+        Self::ensure_epub_page_bitmap(session);
+        let Some(page) = Self::current_epub_page(session).cloned() else {
+            return Ok(());
+        };
         let Some(bitmap) = session.resources.page_bitmap.as_mut() else {
             return Ok(());
         };
         bitmap.clear();
-
-        let local_idx = session
-            .reader
-            .page_idx
-            .saturating_sub(session.reader.page_window_start);
-        let Some(page) = session.resources.page_window.get(local_idx) else {
-            return Ok(());
-        };
         let mut framebuffer =
             PackedBinaryFrameBuffer::new(bitmap.width, bitmap.height, bitmap.bytes_mut())
                 .map_err(|err| format!("Unable to prepare EPUB framebuffer: {:?}", err))?;
-        let renderer = EgRenderer::with_backend(EgRenderConfig::default(), MonoFontBackend);
+        let mut cfg = EgRenderConfig::default();
+        cfg.image_fallback = ImageFallbackPolicy::OutlineOnly;
+        let renderer = EgRenderer::with_backend(cfg, MonoFontBackend);
         let diagnostics = match &mut session.book {
             #[cfg(not(target_os = "espidf"))]
             EpubSessionBook::Generic(inner) => renderer.render_page_with_streamed_images(
                 inner,
-                page,
+                &page,
                 &mut framebuffer,
                 Self::streamed_image_options(),
             ),
             #[cfg(target_os = "espidf")]
             EpubSessionBook::Temp(inner) => renderer.render_page_with_streamed_images(
                 inner,
-                page,
+                &page,
                 &mut framebuffer,
                 Self::streamed_image_options(),
             ),
-        }
-        .map_err(|_| "Unable to rasterize EPUB page.".to_string())?;
+        };
+        let (diagnostics, streamed_images) = match diagnostics {
+            Ok(diagnostics) => (diagnostics, true),
+            Err(_) => {
+                bitmap.clear();
+                let fallback = renderer
+                    .render_page(&page, &mut framebuffer)
+                    .map_err(|_| "Unable to rasterize EPUB page.".to_string())?;
+                let _ = fallback;
+                (Default::default(), false)
+            }
+        };
         let generation = bitmap.next_generation();
         Self::log_epub_event(&format!(
-            "page_bitmap_rendered chapter={} page={} generation={} attempted_images={} decoded_png={} decoded_jpeg={} decoded_gif={} decoded_webp={} decode_failures={} unsupported_sources={} resource_errors={}",
+            "page_bitmap_rendered chapter={} page={} generation={} streamed_images={} attempted_images={} decoded_png={} decoded_jpeg={} decoded_gif={} decoded_webp={} decode_failures={} unsupported_sources={} resource_errors={}",
             session.reader.chapter_idx,
             session.reader.page_idx,
             generation,
+            streamed_images,
             diagnostics.attempted,
             diagnostics.decoded_png,
             diagnostics.decoded_jpeg,
@@ -1704,12 +1738,7 @@ impl HomeActivity {
             Some(window) => {
                 session.apply_reader_window(window, 0);
                 if let Err(err) = Self::refresh_epub_page_bitmap(&mut session) {
-                    self.modal = ModalState::Reader {
-                        title: path.to_string(),
-                        lines: vec![err],
-                        scroll: 0,
-                    };
-                    return;
+                    Self::log_epub_event(&format!("page_bitmap_render_failed reason={}", err));
                 }
                 Self::log_epub_event(&format!(
                     "open_ready chapter={} chapter_count={} total_pages={} window_start={}",
@@ -1950,6 +1979,94 @@ impl HomeActivity {
         );
     }
 
+    #[cfg(feature = "std")]
+    fn draw_epub_page_fallback(
+        &self,
+        ui_ctx: &mut dyn Ui<DefaultTheme>,
+        page: &RenderPage,
+        page_idx: usize,
+        total_pages: usize,
+        chapter_idx: usize,
+        chapter_count: usize,
+    ) {
+        ui_ctx.fill_rect(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 480,
+                height: 800,
+            },
+            Color::White,
+        );
+
+        let commands = if page.content_commands.is_empty() {
+            page.commands.as_slice()
+        } else {
+            page.content_commands.as_slice()
+        };
+        for cmd in commands {
+            match cmd {
+                EpubDrawCommand::Text(text) => {
+                    ui_ctx.draw_text_at(
+                        Point {
+                            x: text.x as i16,
+                            y: text.baseline_y as i16,
+                        },
+                        &text.text,
+                    );
+                }
+                EpubDrawCommand::Rule(rule) => {
+                    let start = Point {
+                        x: rule.x as i16,
+                        y: rule.y as i16,
+                    };
+                    let end = if rule.horizontal {
+                        Point {
+                            x: rule.x.saturating_add(rule.length as i32) as i16,
+                            y: rule.y as i16,
+                        }
+                    } else {
+                        Point {
+                            x: rule.x as i16,
+                            y: rule.y.saturating_add(rule.length as i32) as i16,
+                        }
+                    };
+                    ui_ctx.draw_line(
+                        start,
+                        end,
+                        Color::Black,
+                        rule.thickness.min(u8::MAX as u32) as u8,
+                    );
+                }
+                EpubDrawCommand::Rect(rect) => {
+                    if rect.fill {
+                        ui_ctx.fill_rect(
+                            Rect {
+                                x: rect.x as i16,
+                                y: rect.y as i16,
+                                width: rect.width.min(u16::MAX as u32) as u16,
+                                height: rect.height.min(u16::MAX as u32) as u16,
+                            },
+                            Color::Black,
+                        );
+                    }
+                }
+                EpubDrawCommand::ImageObject(_) | EpubDrawCommand::PageChrome(_) => {}
+            }
+        }
+
+        ui_ctx.draw_text_at(
+            Point { x: 8, y: 794 },
+            &format!(
+                "ch {}/{}  p {}/{}  low-mem",
+                chapter_idx + 1,
+                chapter_count.max(1),
+                page_idx + 1,
+                total_pages.max(1)
+            ),
+        );
+    }
+
     fn render_library(&self, ui_ctx: &mut dyn Ui<DefaultTheme>) {
         let mut items = Vec::new();
         for i in 0..self.library_item_count() {
@@ -2045,6 +2162,7 @@ impl HomeActivity {
         Self::draw_reader_lines(ui_ctx, lines, scroll);
     }
 
+    #[cfg(feature = "std")]
     fn render_epub_reader(
         &self,
         ui_ctx: &mut dyn Ui<DefaultTheme>,
@@ -2052,16 +2170,31 @@ impl HomeActivity {
         chapter_count: usize,
         page_idx: usize,
         total_pages: usize,
-        bitmap: &EpubPageBitmap,
+        bitmap: Option<&EpubPageBitmap>,
+        page: Option<&RenderPage>,
     ) {
-        self.draw_epub_page(
-            ui_ctx,
-            bitmap,
-            page_idx,
-            total_pages,
-            chapter_idx,
-            chapter_count,
-        );
+        if let Some(bitmap) = bitmap {
+            self.draw_epub_page(
+                ui_ctx,
+                bitmap,
+                page_idx,
+                total_pages,
+                chapter_idx,
+                chapter_count,
+            );
+        } else if let Some(page) = page {
+            self.draw_epub_page_fallback(
+                ui_ctx,
+                page,
+                page_idx,
+                total_pages,
+                chapter_idx,
+                chapter_count,
+            );
+        } else {
+            ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "EPUB");
+            ui_ctx.draw_text_at(Point { x: 16, y: 54 }, "Page unavailable.");
+        }
     }
 
     fn render_bottom_bar(&self, ui_ctx: &mut dyn Ui<DefaultTheme>) {
@@ -2585,17 +2718,18 @@ impl Activity<DefaultTheme> for HomeActivity {
                 lines,
                 scroll,
             } => self.render_reader(ui_ctx, title, lines, *scroll),
-            ModalState::EpubReader => {
-                if let Some(session) = self.epub_session.as_ref()
-                    && let Some(bitmap) = session.resources.page_bitmap.as_ref()
-                {
+            ModalState::EpubReader =>
+            {
+                #[cfg(feature = "std")]
+                if let Some(session) = self.epub_session.as_ref() {
                     self.render_epub_reader(
                         ui_ctx,
                         session.reader.chapter_idx,
                         session.reader.chapter_count,
                         session.reader.page_idx,
                         session.reader.total_pages,
-                        bitmap,
+                        session.resources.page_bitmap.as_ref(),
+                        Self::current_epub_page(session),
                     );
                 }
             }
