@@ -152,8 +152,8 @@ impl EreaderRuntime {
 
     pub fn with_backends_and_feed(
         config: DeviceConfig,
-        mut settings: Box<dyn SettingsStore>,
-        mut files: Box<dyn FileStore>,
+        settings: Box<dyn SettingsStore>,
+        files: Box<dyn FileStore>,
         feed_client: Box<dyn FeedClient>,
     ) -> Self {
         let mut noop_probe = |_| {};
@@ -448,15 +448,17 @@ struct EpubPageBitmap {
 
 #[cfg(feature = "std")]
 impl EpubPageBitmap {
-    fn new(width: u32, height: u32) -> Self {
+    fn try_new(width: u32, height: u32) -> Result<Self, String> {
         let len = (width as usize).div_ceil(8).saturating_mul(height as usize);
-        let bytes = alloc::vec![0; len].into_boxed_slice();
-        Self {
+        let bytes = HomeActivity::try_alloc_zeroed(len)
+            .map_err(|_| format!("Unable to allocate {} bytes for EPUB page bitmap", len))?
+            .into_boxed_slice();
+        Ok(Self {
             width,
             height,
             generation: 0,
             bytes: Box::into_raw(bytes),
-        }
+        })
     }
 
     fn clear(&mut self) {
@@ -483,8 +485,6 @@ impl EpubPageBitmap {
 
 #[cfg(feature = "std")]
 struct EpubResources {
-    chapter_buf: Vec<u8>,
-    chapter_scratch: ScratchBuffers,
     page_window: Vec<RenderPage>,
     page_bitmap: Option<EpubPageBitmap>,
 }
@@ -503,8 +503,6 @@ struct EpubReaderState {
 impl Default for EpubResources {
     fn default() -> Self {
         Self {
-            chapter_buf: Vec::new(),
-            chapter_scratch: ScratchBuffers::new(0, 0, 0),
             page_window: Vec::new(),
             page_bitmap: None,
         }
@@ -532,8 +530,6 @@ enum EpubSessionBook {
 #[cfg(feature = "std")]
 impl EpubSession {
     fn into_resources(mut self: Box<Self>) -> EpubResources {
-        self.resources.chapter_buf.clear();
-        self.resources.chapter_scratch.clear();
         self.resources.page_window.clear();
         if let Some(bitmap) = self.resources.page_bitmap.as_mut() {
             bitmap.clear();
@@ -647,10 +643,12 @@ impl HomeActivity {
             #[cfg(feature = "std")]
             epub_session: None,
             #[cfg(feature = "std")]
-            epub_resources: Self::preallocated_epub_resources_with_probe(probe),
+            epub_resources: EpubResources::default(),
             feed_client,
             modal: ModalState::None,
         };
+        #[cfg(feature = "std")]
+        boot_probe(probe, "home_activity:epub_resources_deferred");
         boot_probe(probe, "home_activity:ready");
         activity
     }
@@ -664,7 +662,7 @@ impl HomeActivity {
     }
 
     #[cfg(feature = "std")]
-    fn preallocated_epub_resources() -> EpubResources {
+    fn preallocated_epub_resources() -> Result<EpubResources, String> {
         let mut noop_probe = |_| {};
         Self::preallocated_epub_resources_with_probe(&mut noop_probe)
     }
@@ -672,31 +670,29 @@ impl HomeActivity {
     #[cfg(feature = "std")]
     fn preallocated_epub_resources_with_probe(
         probe: &mut dyn FnMut(&'static str),
-    ) -> EpubResources {
+    ) -> Result<EpubResources, String> {
         boot_probe(probe, "epub_resources:start");
-        let chapter_buf = Vec::with_capacity(Self::EPUB_MAX_CHAPTER_BUF_CAPACITY_BYTES);
-        boot_probe(probe, "epub_resources:after_chapter_buf");
-        let chapter_scratch = ScratchBuffers::embedded();
-        boot_probe(probe, "epub_resources:after_chapter_scratch");
-        let page_window = Vec::with_capacity(Self::EPUB_PAGE_WINDOW.max(1));
+        let page_window = Self::try_alloc_vec(Self::EPUB_PAGE_WINDOW.max(1))
+            .map_err(|_| "Unable to allocate EPUB page window.".to_string())?;
         boot_probe(probe, "epub_resources:after_page_window");
-        let page_bitmap = Some(EpubPageBitmap::new(480, 800));
+        let page_bitmap = Some(EpubPageBitmap::try_new(480, 800)?);
         boot_probe(probe, "epub_resources:after_page_bitmap");
         let resources = EpubResources {
-            chapter_buf,
-            chapter_scratch,
             page_window,
             page_bitmap,
         };
         boot_probe(probe, "epub_resources:ready");
-        resources
+        Ok(resources)
     }
 
     #[cfg(feature = "std")]
-    fn ensure_epub_resources_ready(&mut self) {
-        if self.epub_resources.chapter_buf.capacity() == 0 {
-            self.epub_resources = Self::preallocated_epub_resources();
+    fn ensure_epub_resources_ready(&mut self) -> Result<(), String> {
+        if self.epub_resources.page_bitmap.is_none() {
+            Self::log_epub_event("resource_alloc_begin");
+            self.epub_resources = Self::preallocated_epub_resources()?;
+            Self::log_epub_event("resource_alloc_ready");
         }
+        Ok(())
     }
 
     #[cfg(feature = "std")]
@@ -704,6 +700,12 @@ impl HomeActivity {
         if let Some(session) = self.epub_session.take() {
             self.epub_resources = session.into_resources();
         }
+    }
+
+    #[cfg(feature = "std")]
+    fn release_non_reader_state(&mut self) {
+        self.files = Vec::new();
+        self.feed_sources = Vec::new();
     }
 
     fn ensure_feed_sources_loaded(&mut self) {
@@ -1228,25 +1230,30 @@ impl HomeActivity {
     fn ensure_epub_chapter_capacity(
         session: &mut EpubSession,
         chapter_idx: usize,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<u8>, String> {
         let Ok(required_bytes) = Self::session_chapter_uncompressed_size(session, chapter_idx)
         else {
-            return Ok(());
+            let fallback = Self::EPUB_MAX_CHAPTER_BUF_CAPACITY_BYTES.min(32 * 1024);
+            Self::log_epub_event(&format!(
+                "chapter_size_unknown chapter={} allocating_fallback={}",
+                chapter_idx, fallback
+            ));
+            return Self::try_epub_chapter_buf(fallback);
         };
         Self::log_epub_event(&format!(
-            "chapter_size chapter={} required={} capacity={}",
+            "chapter_size chapter={} required={} cap={}",
             chapter_idx,
             required_bytes,
-            session.resources.chapter_buf.capacity()
+            Self::EPUB_MAX_CHAPTER_BUF_CAPACITY_BYTES
         ));
-        if required_bytes <= session.resources.chapter_buf.capacity() {
-            return Ok(());
+        if required_bytes > Self::EPUB_MAX_CHAPTER_BUF_CAPACITY_BYTES {
+            return Err(format!(
+                "Unable to stream EPUB chapter: required {} bytes exceeds chapter buffer cap {} bytes",
+                required_bytes,
+                Self::EPUB_MAX_CHAPTER_BUF_CAPACITY_BYTES
+            ));
         }
-        Err(format!(
-            "Unable to stream EPUB chapter: required {} bytes exceeds fixed chapter buffer cap {} bytes",
-            required_bytes,
-            session.resources.chapter_buf.capacity()
-        ))
+        Self::try_epub_chapter_buf(required_bytes)
     }
 
     #[cfg(feature = "std")]
@@ -1266,7 +1273,8 @@ impl HomeActivity {
             return Ok(Some((record.page.into(), record.total_pages.max(1))));
         }
 
-        Self::ensure_epub_chapter_capacity(session, chapter_idx)?;
+        let mut chapter_buf = Self::ensure_epub_chapter_capacity(session, chapter_idx)?;
+        let mut chapter_scratch = Self::try_embedded_scratch_buffers()?;
         let chapter_opts = ChapterEventsOptions {
             render: Self::epub_render_prep_options(cfg.font_size_idx),
             max_items: Self::EPUB_MAX_CHAPTER_EVENTS,
@@ -1298,8 +1306,8 @@ impl HomeActivity {
                 .chapter_events_with_scratch(
                     chapter_idx,
                     chapter_opts,
-                    &mut session.resources.chapter_buf,
-                    &mut session.resources.chapter_scratch,
+                    &mut chapter_buf,
+                    &mut chapter_scratch,
                     &mut on_item,
                 )
                 .map(|_| ()),
@@ -1308,8 +1316,8 @@ impl HomeActivity {
                 .chapter_events_with_scratch(
                     chapter_idx,
                     chapter_opts,
-                    &mut session.resources.chapter_buf,
-                    &mut session.resources.chapter_scratch,
+                    &mut chapter_buf,
+                    &mut chapter_scratch,
                     &mut on_item,
                 )
                 .map(|_| ()),
@@ -1474,6 +1482,42 @@ impl HomeActivity {
     }
 
     #[cfg(feature = "std")]
+    fn try_alloc_vec<T>(capacity: usize) -> Result<Vec<T>, ()> {
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(capacity).map_err(|_| ())?;
+        Ok(buf)
+    }
+
+    #[cfg(feature = "std")]
+    fn try_alloc_string(capacity: usize) -> Result<String, ()> {
+        let mut buf = String::new();
+        buf.try_reserve_exact(capacity).map_err(|_| ())?;
+        Ok(buf)
+    }
+
+    #[cfg(feature = "std")]
+    fn try_embedded_scratch_buffers() -> Result<ScratchBuffers, String> {
+        Ok(ScratchBuffers {
+            read_buf: Self::try_alloc_vec(8192)
+                .map_err(|_| "Unable to allocate EPUB read scratch buffer.".to_string())?,
+            xml_buf: Self::try_alloc_vec(4096)
+                .map_err(|_| "Unable to allocate EPUB XML scratch buffer.".to_string())?,
+            text_buf: Self::try_alloc_string(2048)
+                .map_err(|_| "Unable to allocate EPUB text scratch buffer.".to_string())?,
+        })
+    }
+
+    #[cfg(feature = "std")]
+    fn try_epub_chapter_buf(capacity: usize) -> Result<Vec<u8>, String> {
+        Self::try_alloc_vec(capacity).map_err(|_| {
+            format!(
+                "Unable to allocate {} bytes for EPUB chapter buffer",
+                capacity
+            )
+        })
+    }
+
+    #[cfg(feature = "std")]
     fn load_epub_chapter_in_direction(
         session: &mut EpubSession,
         chapter_idx: usize,
@@ -1615,7 +1659,15 @@ impl HomeActivity {
         #[cfg(feature = "std")]
         {
             self.release_epub_session();
-            self.ensure_epub_resources_ready();
+            self.release_non_reader_state();
+            if let Err(message) = self.ensure_epub_resources_ready() {
+                self.modal = ModalState::Reader {
+                    title: path.to_string(),
+                    lines: vec![message],
+                    scroll: 0,
+                };
+                return;
+            }
             Self::log_epub_event(&format!("open_begin path={}", path));
         }
         let cfg = EpubLoadConfig {
