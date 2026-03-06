@@ -1527,28 +1527,20 @@ impl HomeActivity {
     #[inline(never)]
     fn initialize_epub_session(
         mut session: Box<EpubSession>,
-        ctx: &mut Context<'_, DefaultTheme>,
-        cfg: EpubLoadConfig,
+        _ctx: &mut Context<'_, DefaultTheme>,
+        _cfg: EpubLoadConfig,
     ) -> Result<Box<EpubSession>, (Box<EpubSession>, String)> {
         epub_mark!("session_init_begin");
-        match Self::find_readable_epub_chapter(&mut session, ctx, 0, 1, cfg) {
-            Some((chapter_idx, total_pages)) => {
-                let chapter_count = session.chapter_count;
-                session.set_reader_position(chapter_idx, chapter_count, total_pages, 0);
-                epub_trace!(
-                    "open_ready chapter={} chapter_count={} total_pages={}",
-                    session.reader.chapter_idx,
-                    session.reader.chapter_count,
-                    session.reader.total_pages
-                );
-                epub_mark!("session_init_ready");
-                Ok(session)
-            }
-            None => Err((
-                session,
-                "No readable text produced by renderer.".to_string(),
-            )),
-        }
+        let chapter_count = session.chapter_count.max(1);
+        session.set_reader_position(0, chapter_count, 1, 0);
+        epub_trace!(
+            "open_ready chapter={} chapter_count={} total_pages={}",
+            session.reader.chapter_idx,
+            session.reader.chapter_count,
+            session.reader.total_pages
+        );
+        epub_mark!("session_init_ready");
+        Ok(session)
     }
 
     #[cfg(feature = "std")]
