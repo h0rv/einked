@@ -240,11 +240,42 @@ fn load_fixture(name: &str) -> Arc<[u8]> {
     Arc::<[u8]>::from(fs::read(base).expect("fixture book should exist"))
 }
 
-fn runtime_with_books() -> EreaderRuntime {
+#[derive(Clone, Copy)]
+enum ProfilePhase {
+    Boot,
+    EpubOpenNav,
+    EpubOpenFirstPage,
+    EpubPageTurnForward,
+    FeedNav,
+    SettingsNav,
+}
+
+impl ProfilePhase {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "boot" => Some(Self::Boot),
+            "epub_open_nav" => Some(Self::EpubOpenNav),
+            "epub_open_first_page" => Some(Self::EpubOpenFirstPage),
+            "epub_page_turn_forward" => Some(Self::EpubPageTurnForward),
+            "feed_nav" => Some(Self::FeedNav),
+            "settings_nav" => Some(Self::SettingsNav),
+            _ => None,
+        }
+    }
+}
+
+struct Args {
+    out_dir: PathBuf,
+    book: String,
+    fragment: bool,
+    phase: Option<ProfilePhase>,
+}
+
+fn runtime_with_books(book: &str) -> EreaderRuntime {
     let mut files = BTreeMap::new();
     files.insert(
-        "books/pg84-frankenstein.epub".to_string(),
-        load_fixture("pg84-frankenstein.epub"),
+        format!("books/{book}"),
+        load_fixture(book),
     );
     files.insert("books/sample.txt".to_string(), load_fixture("sample.txt"));
     EreaderRuntime::with_backends(
@@ -252,6 +283,27 @@ fn runtime_with_books() -> EreaderRuntime {
         Box::new(TestSettings::default()),
         Box::new(TestFiles::from_map(files)),
     )
+}
+
+fn fragment_heap() -> Vec<Box<[u8]>> {
+    let mut fragments: Vec<Option<Box<[u8]>>> = Vec::with_capacity(192);
+    for idx in 0..192usize {
+        let size = match idx % 6 {
+            0 => 64,
+            1 => 192,
+            2 => 512,
+            3 => 1024,
+            4 => 1536,
+            _ => 2048,
+        };
+        fragments.push(Some(vec![0xA5; size].into_boxed_slice()));
+    }
+    for (idx, slot) in fragments.iter_mut().enumerate() {
+        if idx % 2 == 1 || idx % 7 == 0 {
+            *slot = None;
+        }
+    }
+    fragments.into_iter().flatten().collect()
 }
 
 fn step(runtime: &mut EreaderRuntime, sink: &mut CaptureSink, input: Option<InputEvent>) {
@@ -297,11 +349,12 @@ where
     );
 }
 
-fn profile_runtime_phase<F>(out_dir: &Path, name: &str, f: F)
+fn profile_runtime_phase<F>(out_dir: &Path, name: &str, book: &str, fragment: bool, f: F)
 where
     F: FnOnce(&mut EreaderRuntime, &mut CaptureSink),
 {
-    let mut runtime = runtime_with_books();
+    let kept_fragments = fragment.then(fragment_heap);
+    let mut runtime = runtime_with_books(book);
     let mut sink = CaptureSink::new();
     step(&mut runtime, &mut sink, None);
 
@@ -320,62 +373,124 @@ where
         allocs,
         max_single
     );
+    drop(kept_fragments);
 }
 
-fn parse_out_dir() -> PathBuf {
+fn parse_args() -> Args {
     let mut args = std::env::args().skip(1);
     let mut out_dir = PathBuf::from("target/ui-memory");
+    let mut book = String::from("Fundamental-Accessibility-Tests-Basic-Functionality-v2.0.0.epub");
+    let mut fragment = false;
+    let mut phase = None;
     while let Some(arg) = args.next() {
-        if arg == "--out-dir"
-            && let Some(value) = args.next()
-        {
-            out_dir = PathBuf::from(value);
+        match arg.as_str() {
+            "--out-dir" => {
+                if let Some(value) = args.next() {
+                    out_dir = PathBuf::from(value);
+                }
+            }
+            "--book" => {
+                if let Some(value) = args.next() {
+                    book = value;
+                }
+            }
+            "--fragment" => {
+                fragment = true;
+            }
+            "--phase" => {
+                if let Some(value) = args.next() {
+                    phase = ProfilePhase::parse(&value);
+                }
+            }
+            _ => {}
         }
     }
-    out_dir
+    Args {
+        out_dir,
+        book,
+        fragment,
+        phase,
+    }
 }
 
 fn main() {
-    let out_dir = parse_out_dir();
+    let args = parse_args();
+    let out_dir = args.out_dir;
     let _ = fs::create_dir_all(&out_dir);
 
-    profile_phase(&out_dir, "boot", || {
-        let mut runtime = runtime_with_books();
-        let mut sink = CaptureSink::new();
-        step(&mut runtime, &mut sink, None);
-    });
+    if args.phase.is_none() || matches!(args.phase, Some(ProfilePhase::Boot)) {
+        profile_phase(&out_dir, "boot", || {
+            let mut runtime = runtime_with_books(&args.book);
+            let mut sink = CaptureSink::new();
+            step(&mut runtime, &mut sink, None);
+        });
+    }
 
-    profile_runtime_phase(&out_dir, "epub_open_nav", |runtime, sink| {
-        step(runtime, sink, Some(InputEvent::Press(Button::Confirm)));
-        step(runtime, sink, Some(InputEvent::Press(Button::Right)));
-        step(runtime, sink, Some(InputEvent::Press(Button::Right)));
-        step(runtime, sink, Some(InputEvent::Press(Button::Aux2)));
-    });
+    if args.phase.is_none() || matches!(args.phase, Some(ProfilePhase::EpubOpenNav)) {
+        profile_runtime_phase(
+            &out_dir,
+            "epub_open_nav",
+            &args.book,
+            args.fragment,
+            |runtime, sink| {
+                step(runtime, sink, Some(InputEvent::Press(Button::Confirm)));
+                step(runtime, sink, Some(InputEvent::Press(Button::Right)));
+                step(runtime, sink, Some(InputEvent::Press(Button::Right)));
+                step(runtime, sink, Some(InputEvent::Press(Button::Aux2)));
+            },
+        );
+    }
 
-    profile_runtime_phase(&out_dir, "epub_open_first_page", |runtime, sink| {
-        step(runtime, sink, Some(InputEvent::Press(Button::Confirm)));
-    });
+    if args.phase.is_none() || matches!(args.phase, Some(ProfilePhase::EpubOpenFirstPage)) {
+        profile_runtime_phase(
+            &out_dir,
+            "epub_open_first_page",
+            &args.book,
+            args.fragment,
+            |runtime, sink| {
+                step(runtime, sink, Some(InputEvent::Press(Button::Confirm)));
+            },
+        );
+    }
 
-    profile_runtime_phase(&out_dir, "epub_page_turn_forward", |runtime, sink| {
-        step(runtime, sink, Some(InputEvent::Press(Button::Confirm)));
-        step(runtime, sink, Some(InputEvent::Press(Button::Right)));
-    });
+    if args.phase.is_none() || matches!(args.phase, Some(ProfilePhase::EpubPageTurnForward)) {
+        profile_runtime_phase(
+            &out_dir,
+            "epub_page_turn_forward",
+            &args.book,
+            args.fragment,
+            |runtime, sink| {
+                step(runtime, sink, Some(InputEvent::Press(Button::Confirm)));
+                step(runtime, sink, Some(InputEvent::Press(Button::Right)));
+            },
+        );
+    }
 
-    profile_runtime_phase(&out_dir, "feed_nav", |runtime, sink| {
-        step(runtime, sink, Some(InputEvent::Press(Button::Right)));
-        step(runtime, sink, Some(InputEvent::Press(Button::Right)));
-        step(runtime, sink, Some(InputEvent::Press(Button::Confirm)));
-        step(runtime, sink, Some(InputEvent::Press(Button::Confirm)));
-    });
+    if args.phase.is_none() || matches!(args.phase, Some(ProfilePhase::FeedNav)) {
+        profile_runtime_phase(&out_dir, "feed_nav", &args.book, args.fragment, |runtime, sink| {
+            step(runtime, sink, Some(InputEvent::Press(Button::Right)));
+            step(runtime, sink, Some(InputEvent::Press(Button::Right)));
+            step(runtime, sink, Some(InputEvent::Press(Button::Confirm)));
+            step(runtime, sink, Some(InputEvent::Press(Button::Confirm)));
+        });
+    }
 
-    profile_runtime_phase(&out_dir, "settings_nav", |runtime, sink| {
-        step(runtime, sink, Some(InputEvent::Press(Button::Right)));
-        step(runtime, sink, Some(InputEvent::Press(Button::Right)));
-        step(runtime, sink, Some(InputEvent::Press(Button::Right)));
-        step(runtime, sink, Some(InputEvent::Press(Button::Confirm)));
-        step(runtime, sink, Some(InputEvent::Press(Button::Down)));
-        step(runtime, sink, Some(InputEvent::Press(Button::Confirm)));
-    });
+    if args.phase.is_none() || matches!(args.phase, Some(ProfilePhase::SettingsNav)) {
+        profile_runtime_phase(
+            &out_dir,
+            "settings_nav",
+            &args.book,
+            args.fragment,
+            |runtime, sink| {
+                step(runtime, sink, Some(InputEvent::Press(Button::Right)));
+                step(runtime, sink, Some(InputEvent::Press(Button::Right)));
+                step(runtime, sink, Some(InputEvent::Press(Button::Right)));
+                step(runtime, sink, Some(InputEvent::Press(Button::Confirm)));
+                step(runtime, sink, Some(InputEvent::Press(Button::Down)));
+                step(runtime, sink, Some(InputEvent::Press(Button::Confirm)));
+            },
+        );
+    }
 
     eprintln!(
         "wrote profiles to {} (ui-mem-*.json)",

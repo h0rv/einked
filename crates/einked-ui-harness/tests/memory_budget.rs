@@ -473,6 +473,40 @@ fn epub_temp_open_embedded_limits_has_bounded_single_alloc() {
 }
 
 #[test]
+fn epub_temp_open_survives_fragmented_allocator() {
+    let _guard = test_guard();
+    let kept_fragments = fragment_heap();
+    let book_path = fixture_path("Fundamental-Accessibility-Tests-Basic-Functionality-v2.0.0.epub");
+    let temp_dir = std::env::temp_dir().join("xteink-epub-temp-frag");
+    let _ = fs::create_dir_all(&temp_dir);
+
+    let open_cfg = OpenConfig {
+        options: EpubBookOptions {
+            zip_limits: Some(ZipLimits::new(256 * 1024, 128).with_max_eocd_scan(8 * 1024)),
+            validation_mode: ValidationMode::Lenient,
+            max_nav_bytes: Some(32 * 1024),
+            navigation_limits: NavigationLimits::embedded(),
+            metadata_limits: MetadataLimits::embedded(),
+        },
+        lazy_navigation: true,
+    };
+
+    ALLOC.reset();
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        let book = EpubBook::open_with_temp_storage(&book_path, &temp_dir, open_cfg)
+            .expect("temp-storage open should succeed on fragmented allocator");
+        assert!(book.chapter_count() > 0, "book should expose chapters");
+    }));
+
+    drop(kept_fragments);
+
+    assert!(
+        result.is_ok(),
+        "temp-backed EPUB open panicked under fragmented allocator pressure"
+    );
+}
+
+#[test]
 fn epub_open_and_first_page_have_bounded_phase_allocations() {
     let _guard = test_guard();
     let mut runtime = runtime_with_books();
