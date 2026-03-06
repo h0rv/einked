@@ -29,6 +29,8 @@ use std::hash::{Hash, Hasher};
 #[cfg(feature = "std")]
 use std::path::{Path, PathBuf};
 #[cfg(feature = "std")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "std")]
 use std::sync::{Mutex, OnceLock};
 #[cfg(feature = "std")]
 use std::time::UNIX_EPOCH;
@@ -62,6 +64,8 @@ pub mod feed_browser;
 
 #[cfg(feature = "std")]
 static DEBUG_SNAPSHOT: OnceLock<Mutex<String>> = OnceLock::new();
+#[cfg(feature = "std")]
+static EPUB_PENDING_WORK: AtomicBool = AtomicBool::new(false);
 
 pub use embedded_fonts::{
     BOOKERLY_BOLD, BOOKERLY_BOLD_ITALIC, BOOKERLY_ITALIC, BOOKERLY_REGULAR, BOOKERLY_SET,
@@ -90,6 +94,11 @@ pub fn debug_snapshot() -> String {
         Ok(_) => "runtime=ereader snapshot=uninitialized".to_string(),
         Err(_) => "runtime=ereader snapshot=poisoned".to_string(),
     }
+}
+
+#[cfg(feature = "std")]
+pub fn has_pending_epub_work() -> bool {
+    EPUB_PENDING_WORK.load(Ordering::Relaxed)
 }
 
 pub trait FrameSink {
@@ -771,6 +780,12 @@ impl HomeActivity {
 
     #[cfg(feature = "std")]
     fn refresh_debug_snapshot(&self) {
+        let pending_epub_work = self
+            .epub_session
+            .as_ref()
+            .and_then(|session| session.reader.pending_action)
+            .is_some();
+        EPUB_PENDING_WORK.store(pending_epub_work, Ordering::Relaxed);
         let mut snapshot = format!(
             "tab={:?} modal={} reader_only={} files={} feeds={} ",
             self.tab,
