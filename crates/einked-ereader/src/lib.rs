@@ -1127,6 +1127,21 @@ impl HomeActivity {
     }
 
     #[cfg(feature = "std")]
+    fn should_store_book_snapshot() -> bool {
+        #[cfg(target_os = "espidf")]
+        {
+            let free_heap = unsafe { sys::esp_get_free_heap_size() } as usize;
+            let largest_8bit =
+                unsafe { sys::heap_caps_get_largest_free_block(sys::MALLOC_CAP_8BIT) } as usize;
+            free_heap >= 40 * 1024 && largest_8bit >= 16 * 1024
+        }
+        #[cfg(not(target_os = "espidf"))]
+        {
+            true
+        }
+    }
+
+    #[cfg(feature = "std")]
     fn create_epub_engine(
         font_size_idx: usize,
         auto_sleep_idx: usize,
@@ -1431,9 +1446,15 @@ impl HomeActivity {
                 "book_snapshot_cache_miss".to_string()
             };
             Self::log_epub_event(&snapshot_event);
-            cache.store_book_snapshot(&Self::cacheable_book_snapshot(&book, &native_path));
+            if Self::should_store_book_snapshot() {
+                cache.store_book_snapshot(&Self::cacheable_book_snapshot(&book, &native_path));
+                Self::log_epub_event("book_snapshot_store_ready");
+            } else {
+                Self::log_epub_event("book_snapshot_store_skipped");
+            }
             cache
         });
+        Self::log_epub_event("session_box_begin");
         Ok(Box::new(EpubSession {
             book,
             engine,
