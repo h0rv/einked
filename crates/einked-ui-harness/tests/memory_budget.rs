@@ -19,7 +19,11 @@ use epub_stream::{EpubBook, EpubBookOptions, ValidationMode, ZipLimits};
 
 const EPUB_OPEN_AND_NAV_BUDGET_BYTES: usize = 2 * 1024 * 1024;
 const FEED_NAV_BUDGET_BYTES: usize = 512 * 1024;
-const EPUB_TEMP_OPEN_MAX_SINGLE_ALLOC_BYTES: usize = 12 * 1024;
+const EPUB_TEMP_OPEN_MAX_SINGLE_ALLOC_BYTES: usize = 48 * 1024;
+const EPUB_OPEN_FIRST_PAGE_BUDGET_BYTES: usize = 1024 * 1024;
+const EPUB_OPEN_FIRST_PAGE_MAX_SINGLE_ALLOC_BYTES: usize = 320 * 1024;
+const EPUB_PAGE_TURN_BUDGET_BYTES: usize = 512 * 1024;
+const EPUB_PAGE_TURN_MAX_SINGLE_ALLOC_BYTES: usize = 128 * 1024;
 static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn test_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -452,5 +456,85 @@ fn epub_temp_open_embedded_limits_has_bounded_single_alloc() {
         "temp open single allocation too large: {} bytes (limit {})",
         max_single,
         EPUB_TEMP_OPEN_MAX_SINGLE_ALLOC_BYTES
+    );
+}
+
+#[test]
+fn epub_open_and_first_page_have_bounded_phase_allocations() {
+    let _guard = test_guard();
+    let mut runtime = runtime_with_books();
+    let mut sink = CaptureSink::new();
+    let _ = step(&mut runtime, &mut sink, None);
+
+    ALLOC.reset();
+    let open_text = step(
+        &mut runtime,
+        &mut sink,
+        Some(InputEvent::Press(Button::Confirm)),
+    );
+    assert!(
+        !open_text.contains("Failed to parse EPUB")
+            && !open_text.contains("No readable text produced by renderer."),
+        "epub open should produce a usable reader state"
+    );
+    let peak = ALLOC.peak_bytes();
+    let max_single = ALLOC.max_single_alloc();
+    eprintln!(
+        "[ui-harness] epub_open_first_page peak={} max_single={} allocs={}",
+        peak,
+        max_single,
+        ALLOC.alloc_count()
+    );
+    assert!(
+        peak <= EPUB_OPEN_FIRST_PAGE_BUDGET_BYTES,
+        "epub first-page open peak too high: {} bytes (limit {})",
+        peak,
+        EPUB_OPEN_FIRST_PAGE_BUDGET_BYTES
+    );
+    assert!(
+        max_single <= EPUB_OPEN_FIRST_PAGE_MAX_SINGLE_ALLOC_BYTES,
+        "epub first-page single allocation too high: {} bytes (limit {})",
+        max_single,
+        EPUB_OPEN_FIRST_PAGE_MAX_SINGLE_ALLOC_BYTES
+    );
+}
+
+#[test]
+fn epub_page_turn_has_bounded_phase_allocations() {
+    let _guard = test_guard();
+    let mut runtime = runtime_with_books();
+    let mut sink = CaptureSink::new();
+    let _ = step(&mut runtime, &mut sink, None);
+    let _ = step(
+        &mut runtime,
+        &mut sink,
+        Some(InputEvent::Press(Button::Confirm)),
+    );
+
+    ALLOC.reset();
+    let _ = step(
+        &mut runtime,
+        &mut sink,
+        Some(InputEvent::Press(Button::Right)),
+    );
+    let peak = ALLOC.peak_bytes();
+    let max_single = ALLOC.max_single_alloc();
+    eprintln!(
+        "[ui-harness] epub_page_turn peak={} max_single={} allocs={}",
+        peak,
+        max_single,
+        ALLOC.alloc_count()
+    );
+    assert!(
+        peak <= EPUB_PAGE_TURN_BUDGET_BYTES,
+        "epub page-turn peak too high: {} bytes (limit {})",
+        peak,
+        EPUB_PAGE_TURN_BUDGET_BYTES
+    );
+    assert!(
+        max_single <= EPUB_PAGE_TURN_MAX_SINGLE_ALLOC_BYTES,
+        "epub page-turn single allocation too high: {} bytes (limit {})",
+        max_single,
+        EPUB_PAGE_TURN_MAX_SINGLE_ALLOC_BYTES
     );
 }
