@@ -76,6 +76,10 @@ pub trait FrameSink {
     fn render_and_flush(&mut self, cmds: &[DrawCmd<'static>], hint: RefreshHint) -> bool;
 }
 
+fn boot_probe(probe: &mut dyn FnMut(&'static str), label: &'static str) {
+    probe(label);
+}
+
 #[cfg(target_os = "espidf")]
 const FRAME_CMD_CAPACITY: usize = 32;
 #[cfg(not(target_os = "espidf"))]
@@ -152,34 +156,57 @@ impl EreaderRuntime {
         mut files: Box<dyn FileStore>,
         feed_client: Box<dyn FeedClient>,
     ) -> Self {
+        let mut noop_probe = |_| {};
+        Self::with_backends_and_feed_with_probe(
+            config,
+            settings,
+            files,
+            feed_client,
+            &mut noop_probe,
+        )
+    }
+
+    pub fn with_backends_and_feed_with_probe(
+        config: DeviceConfig,
+        mut settings: Box<dyn SettingsStore>,
+        mut files: Box<dyn FileStore>,
+        feed_client: Box<dyn FeedClient>,
+        probe: &mut dyn FnMut(&'static str),
+    ) -> Self {
+        boot_probe(probe, "ereader_runtime:start");
         let mut stack = ActivityStack::new();
+        boot_probe(probe, "ereader_runtime:after_stack");
         let theme = DefaultTheme;
         let feed_client = Rc::new(RefCell::new(feed_client));
+        boot_probe(probe, "ereader_runtime:after_feed_client_rc");
         let mut ctx = Context {
             theme: &theme,
             screen: config.screen,
             settings: settings.as_mut(),
             files: files.as_mut(),
         };
-        let _ = stack.push_root(
-            Box::new(HomeActivity::new_with_device_and_feed(
-                config,
-                feed_client.clone(),
-            )),
-            &mut ctx,
-        );
+        boot_probe(probe, "ereader_runtime:after_context");
+        let home =
+            HomeActivity::new_with_device_and_feed_with_probe(config, feed_client.clone(), probe);
+        boot_probe(probe, "ereader_runtime:after_home_activity");
+        let _ = stack.push_root(Box::new(home), &mut ctx);
+        boot_probe(probe, "ereader_runtime:after_push_root");
 
         let mut pipeline = FramePipeline::new(config.partial_refresh_limit);
+        boot_probe(probe, "ereader_runtime:after_pipeline_new");
         pipeline.set_viewport_width(config.screen.width);
+        boot_probe(probe, "ereader_runtime:after_pipeline_viewport");
 
-        Self {
+        let runtime = Self {
             stack,
             pipeline,
             theme,
             settings,
             files,
             config,
-        }
+        };
+        boot_probe(probe, "ereader_runtime:ready");
+        runtime
     }
 
     pub fn config(&self) -> DeviceConfig {
@@ -588,8 +615,19 @@ impl HomeActivity {
         config: DeviceConfig,
         feed_client: Rc<RefCell<Box<dyn FeedClient>>>,
     ) -> Self {
+        let mut noop_probe = |_| {};
+        Self::new_with_device_and_feed_with_probe(config, feed_client, &mut noop_probe)
+    }
+
+    fn new_with_device_and_feed_with_probe(
+        config: DeviceConfig,
+        feed_client: Rc<RefCell<Box<dyn FeedClient>>>,
+        probe: &mut dyn FnMut(&'static str),
+    ) -> Self {
+        boot_probe(probe, "home_activity:start");
         let feed_sources = Self::build_feed_sources();
-        Self {
+        boot_probe(probe, "home_activity:after_feed_sources");
+        let activity = Self {
             tab: MainTab::Library,
             library_idx: 0,
             files_idx: 0,
@@ -609,10 +647,12 @@ impl HomeActivity {
             #[cfg(feature = "std")]
             epub_session: None,
             #[cfg(feature = "std")]
-            epub_resources: Self::preallocated_epub_resources(),
+            epub_resources: Self::preallocated_epub_resources_with_probe(probe),
             feed_client,
             modal: ModalState::None,
-        }
+        };
+        boot_probe(probe, "home_activity:ready");
+        activity
     }
 
     fn build_feed_sources() -> Vec<(String, String, FeedType)> {
@@ -625,12 +665,31 @@ impl HomeActivity {
 
     #[cfg(feature = "std")]
     fn preallocated_epub_resources() -> EpubResources {
-        EpubResources {
-            chapter_buf: Vec::with_capacity(Self::EPUB_MAX_CHAPTER_BUF_CAPACITY_BYTES),
-            chapter_scratch: ScratchBuffers::embedded(),
-            page_window: Vec::with_capacity(Self::EPUB_PAGE_WINDOW.max(1)),
-            page_bitmap: Some(EpubPageBitmap::new(480, 800)),
-        }
+        let mut noop_probe = |_| {};
+        Self::preallocated_epub_resources_with_probe(&mut noop_probe)
+    }
+
+    #[cfg(feature = "std")]
+    fn preallocated_epub_resources_with_probe(
+        probe: &mut dyn FnMut(&'static str),
+    ) -> EpubResources {
+        boot_probe(probe, "epub_resources:start");
+        let chapter_buf = Vec::with_capacity(Self::EPUB_MAX_CHAPTER_BUF_CAPACITY_BYTES);
+        boot_probe(probe, "epub_resources:after_chapter_buf");
+        let chapter_scratch = ScratchBuffers::embedded();
+        boot_probe(probe, "epub_resources:after_chapter_scratch");
+        let page_window = Vec::with_capacity(Self::EPUB_PAGE_WINDOW.max(1));
+        boot_probe(probe, "epub_resources:after_page_window");
+        let page_bitmap = Some(EpubPageBitmap::new(480, 800));
+        boot_probe(probe, "epub_resources:after_page_bitmap");
+        let resources = EpubResources {
+            chapter_buf,
+            chapter_scratch,
+            page_window,
+            page_bitmap,
+        };
+        boot_probe(probe, "epub_resources:ready");
+        resources
     }
 
     #[cfg(feature = "std")]
@@ -1486,10 +1545,15 @@ impl HomeActivity {
         if cfg!(target_os = "espidf") {
             StreamedImageOptions {
                 max_image_bytes: 256 * 1024,
+                max_decoded_bytes: 384 * 1024,
                 decode_png: true,
             }
         } else {
-            StreamedImageOptions::default()
+            StreamedImageOptions {
+                max_image_bytes: 256 * 1024,
+                max_decoded_bytes: 384 * 1024,
+                decode_png: true,
+            }
         }
     }
 
@@ -1530,12 +1594,15 @@ impl HomeActivity {
         .map_err(|_| "Unable to rasterize EPUB page.".to_string())?;
         let generation = bitmap.next_generation();
         Self::log_epub_event(&format!(
-            "page_bitmap_rendered chapter={} page={} generation={} attempted_images={} decoded_png={} decode_failures={} unsupported_sources={} resource_errors={}",
+            "page_bitmap_rendered chapter={} page={} generation={} attempted_images={} decoded_png={} decoded_jpeg={} decoded_gif={} decoded_webp={} decode_failures={} unsupported_sources={} resource_errors={}",
             session.reader.chapter_idx,
             session.reader.page_idx,
             generation,
             diagnostics.attempted,
             diagnostics.decoded_png,
+            diagnostics.decoded_jpeg,
+            diagnostics.decoded_gif,
+            diagnostics.decoded_webp,
             diagnostics.decode_failures,
             diagnostics.unsupported_sources,
             diagnostics.resource_errors

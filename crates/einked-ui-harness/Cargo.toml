@@ -16,4 +16,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 name = "ui-heap-profile"
 path = "src/bin/ui_heap_profile.rs"
 
+[[bin]]
+name = "ui-boot-phase-profile"
+path = "src/bin/ui_boot_phase_profile.rs"
+
 [workspace]
