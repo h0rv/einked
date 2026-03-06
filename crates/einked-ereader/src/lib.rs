@@ -458,6 +458,7 @@ struct EpubLoadConfig {
     font_size_idx: usize,
     auto_sleep_idx: usize,
     font_family_idx: usize,
+    images_enabled: bool,
     display_width: i32,
     display_height: i32,
 }
@@ -590,6 +591,10 @@ impl EpubSession {
         self.load_cfg.font_family_idx
     }
 
+    fn images_enabled(&self) -> bool {
+        self.load_cfg.images_enabled
+    }
+
     fn schedule_pending_action(&mut self, action: EpubPendingAction) {
         self.reader.pending_action = Some(action);
     }
@@ -606,6 +611,7 @@ struct HomeActivity {
     feed_sources: Vec<(String, String, FeedType)>,
     font_size_idx: usize,
     font_family_idx: usize,
+    epub_images_idx: usize,
     auto_sleep_idx: usize,
     refresh_idx: usize,
     invert_colors_idx: usize,
@@ -658,6 +664,7 @@ impl HomeActivity {
             feed_sources,
             font_size_idx: 1,
             font_family_idx: 0,
+            epub_images_idx: 0,
             auto_sleep_idx: 1,
             refresh_idx: 0,
             invert_colors_idx: 0,
@@ -763,16 +770,18 @@ impl HomeActivity {
 
     const FONT_SIZE_OPTIONS: [&'static str; 3] = ["Small", "Medium", "Large"];
     const FONT_FAMILY_OPTIONS: [&'static str; 3] = ["Serif", "Sans", "Mono"];
+    const EPUB_IMAGES_OPTIONS: [&'static str; 2] = ["Off", "On"];
     const AUTO_SLEEP_OPTIONS: [&'static str; 4] = ["5m", "10m", "15m", "Never"];
     const REFRESH_OPTIONS: [&'static str; 3] = ["Never", "Every Page", "Every Chapter"];
     const INVERT_COLORS_OPTIONS: [&'static str; 2] = ["Off", "On"];
-    const SETTINGS_ITEM_COUNT: usize = 5;
+    const SETTINGS_ITEM_COUNT: usize = 6;
     const TRANSFER_ITEMS: [&'static str; 3] = ["Edit AP SSID", "Edit AP Password", "Start/Restart"];
     const SETTING_KEY_FONT_SIZE: u8 = 1;
     const SETTING_KEY_FONT_FAMILY: u8 = 2;
     const SETTING_KEY_AUTO_SLEEP: u8 = 3;
     const SETTING_KEY_REFRESH: u8 = 4;
     const SETTING_KEY_INVERT_COLORS: u8 = 5;
+    const SETTING_KEY_EPUB_IMAGES: u8 = 6;
     const SETTING_KEY_WIFI_ACTIVE: u8 = 240;
     const SETTING_KEY_WIFI_ENABLE_REQUEST: u8 = 241;
     const MAX_LIBRARY_SCAN_DEPTH: usize = 16;
@@ -799,6 +808,12 @@ impl HomeActivity {
             Self::SETTING_KEY_FONT_FAMILY,
             Self::FONT_FAMILY_OPTIONS.len(),
             self.font_family_idx,
+        );
+        self.epub_images_idx = Self::load_setting_idx(
+            ctx,
+            Self::SETTING_KEY_EPUB_IMAGES,
+            Self::EPUB_IMAGES_OPTIONS.len(),
+            self.epub_images_idx,
         );
         self.auto_sleep_idx = Self::load_setting_idx(
             ctx,
@@ -862,6 +877,10 @@ impl HomeActivity {
                 Self::FONT_FAMILY_OPTIONS[self.font_family_idx]
             ),
             format!(
+                "EPUB Images: {}",
+                Self::EPUB_IMAGES_OPTIONS[self.epub_images_idx]
+            ),
+            format!(
                 "Auto Sleep: {}",
                 Self::AUTO_SLEEP_OPTIONS[self.auto_sleep_idx]
             ),
@@ -884,14 +903,18 @@ impl HomeActivity {
                 Self::save_setting_idx(ctx, Self::SETTING_KEY_FONT_FAMILY, self.font_family_idx);
             }
             2 => {
+                self.epub_images_idx = (self.epub_images_idx + 1) % Self::EPUB_IMAGES_OPTIONS.len();
+                Self::save_setting_idx(ctx, Self::SETTING_KEY_EPUB_IMAGES, self.epub_images_idx);
+            }
+            3 => {
                 self.auto_sleep_idx = (self.auto_sleep_idx + 1) % Self::AUTO_SLEEP_OPTIONS.len();
                 Self::save_setting_idx(ctx, Self::SETTING_KEY_AUTO_SLEEP, self.auto_sleep_idx);
             }
-            3 => {
+            4 => {
                 self.refresh_idx = (self.refresh_idx + 1) % Self::REFRESH_OPTIONS.len();
                 Self::save_setting_idx(ctx, Self::SETTING_KEY_REFRESH, self.refresh_idx);
             }
-            4 => {
+            5 => {
                 self.invert_colors_idx =
                     (self.invert_colors_idx + 1) % Self::INVERT_COLORS_OPTIONS.len();
                 Self::save_setting_idx(
@@ -1388,6 +1411,7 @@ impl HomeActivity {
     #[inline(never)]
     fn rasterize_epub_page_to_bitmap(
         worker: &mut EpubTransientWorker,
+        images_enabled: bool,
         page: &RenderPage,
         framebuffer: &mut PackedBinaryFrameBuffer<'_>,
     ) -> Result<
@@ -1402,6 +1426,13 @@ impl HomeActivity {
             ..Default::default()
         };
         let renderer = EgRenderer::with_backend(cfg, MonoFontBackend);
+        if !images_enabled {
+            framebuffer.as_bytes_mut().fill(0);
+            renderer
+                .render_page(page, framebuffer)
+                .map_err(|_| "Unable to rasterize EPUB page.".to_string())?;
+            return Ok((Default::default(), false));
+        }
         let diagnostics = match &mut worker.book {
             #[cfg(not(target_os = "espidf"))]
             EpubSessionBook::Generic(inner) => renderer.render_page_with_streamed_images(
@@ -1869,6 +1900,7 @@ impl HomeActivity {
             session.reader.page_idx,
             session.reader.total_pages
         );
+        let images_enabled = session.images_enabled();
         if session.resources.page_bitmap.is_none() {
             session.resources.page_fallback_lines = Self::render_page_fallback_lines(&page);
             return Ok(());
@@ -1883,7 +1915,7 @@ impl HomeActivity {
                 .map_err(|err| format!("Unable to prepare EPUB framebuffer: {:?}", err))?;
         epub_mark!("page_bitmap_render_begin");
         let (diagnostics, streamed_images) =
-            Self::rasterize_epub_page_to_bitmap(worker, &page, &mut framebuffer)?;
+            Self::rasterize_epub_page_to_bitmap(worker, images_enabled, &page, &mut framebuffer)?;
         let generation = bitmap.next_generation();
         #[cfg(all(target_os = "espidf", not(debug_assertions)))]
         {
@@ -1972,6 +2004,7 @@ impl HomeActivity {
             font_size_idx: self.font_size_idx,
             auto_sleep_idx: self.auto_sleep_idx,
             font_family_idx: self.font_family_idx,
+            images_enabled: self.epub_images_idx != 0,
             display_width: self.epub_display_width,
             display_height: self.epub_display_height,
         };
@@ -2458,6 +2491,7 @@ impl Activity<DefaultTheme> for HomeActivity {
             font_size_idx: self.font_size_idx,
             auto_sleep_idx: self.auto_sleep_idx,
             font_family_idx: self.font_family_idx,
+            images_enabled: self.epub_images_idx != 0,
             display_width: self.epub_display_width,
             display_height: self.epub_display_height,
         };
