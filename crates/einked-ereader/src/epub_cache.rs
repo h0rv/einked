@@ -8,24 +8,44 @@ use std::time::UNIX_EPOCH;
 use epub_stream_render::PaginationProfileId;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct CachedTextRun {
-    pub x: i32,
-    pub baseline_y: i32,
-    pub text: String,
-}
+pub type CachedDrawCommand = epub_stream_render::persisted::PersistedDrawCommand;
+pub type CachedImageObjectCommand = epub_stream_render::persisted::PersistedImageObjectCommand;
+pub type CachedPageChromeKind = epub_stream_render::persisted::PersistedPageChromeKind;
+pub type CachedRectCommand = epub_stream_render::persisted::PersistedRectCommand;
+pub type CachedRenderPage = epub_stream_render::persisted::PersistedRenderPage;
+pub type CachedRuleCommand = epub_stream_render::persisted::PersistedRuleCommand;
+pub type CachedTextCommand = epub_stream_render::persisted::PersistedTextCommand;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct CachedEpubPage {
-    pub text_runs: Vec<CachedTextRun>,
-}
+const PAGE_CACHE_SCHEMA_VERSION: u8 = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CachedPageRecord {
+    pub version: u8,
     pub chapter_index: usize,
     pub page_index: usize,
     pub total_pages: usize,
-    pub page: CachedEpubPage,
+    pub page: CachedRenderPage,
+}
+
+impl CachedPageRecord {
+    pub fn new(
+        chapter_index: usize,
+        page_index: usize,
+        total_pages: usize,
+        page: CachedRenderPage,
+    ) -> Self {
+        Self {
+            version: PAGE_CACHE_SCHEMA_VERSION,
+            chapter_index,
+            page_index,
+            total_pages,
+            page,
+        }
+    }
+
+    fn is_compatible(&self) -> bool {
+        self.version == PAGE_CACHE_SCHEMA_VERSION
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -37,12 +57,38 @@ pub struct CachedChapterEntry {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CachedBookSnapshot {
+    pub version: u8,
     pub source_path: String,
     pub title: String,
     pub author: String,
     pub language: String,
     pub chapter_count: usize,
     pub chapters: Vec<CachedChapterEntry>,
+}
+
+impl CachedBookSnapshot {
+    pub fn new(
+        source_path: String,
+        title: String,
+        author: String,
+        language: String,
+        chapter_count: usize,
+        chapters: Vec<CachedChapterEntry>,
+    ) -> Self {
+        Self {
+            version: PAGE_CACHE_SCHEMA_VERSION,
+            source_path,
+            title,
+            author,
+            language,
+            chapter_count,
+            chapters,
+        }
+    }
+
+    fn is_compatible(&self) -> bool {
+        self.version == PAGE_CACHE_SCHEMA_VERSION
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -66,8 +112,17 @@ impl EpubPageCache {
     pub fn load_page(&self, chapter_index: usize, page_index: usize) -> Option<CachedPageRecord> {
         let path = self.page_path(chapter_index, page_index);
         let file = fs::File::open(&path).ok()?;
-        match serde_json::from_reader(BufReader::new(file)) {
-            Ok(record) => Some(record),
+        match serde_json::from_reader::<_, CachedPageRecord>(BufReader::new(file)) {
+            Ok(record) if record.is_compatible() => Some(record),
+            Ok(record) => {
+                log::info!(
+                    "epub page cache schema mismatch at {}: {} != {}",
+                    path.display(),
+                    record.version,
+                    PAGE_CACHE_SCHEMA_VERSION
+                );
+                None
+            }
             Err(err) => {
                 log::warn!(
                     "epub page cache decode failed at {}: {}",
@@ -114,8 +169,17 @@ impl EpubPageCache {
     pub fn load_book_snapshot(&self) -> Option<CachedBookSnapshot> {
         let path = self.book_snapshot_path();
         let file = fs::File::open(&path).ok()?;
-        match serde_json::from_reader(BufReader::new(file)) {
-            Ok(snapshot) => Some(snapshot),
+        match serde_json::from_reader::<_, CachedBookSnapshot>(BufReader::new(file)) {
+            Ok(snapshot) if snapshot.is_compatible() => Some(snapshot),
+            Ok(snapshot) => {
+                log::info!(
+                    "epub book snapshot schema mismatch at {}: {} != {}",
+                    path.display(),
+                    snapshot.version,
+                    PAGE_CACHE_SCHEMA_VERSION
+                );
+                None
+            }
             Err(err) => {
                 log::warn!(
                     "epub book snapshot decode failed at {}: {}",
@@ -195,7 +259,10 @@ fn book_cache_key(native_path: &str) -> String {
 
 fn profile_cache_key(profile: PaginationProfileId, font_family_idx: usize) -> String {
     let profile_hex = profile_hex(profile);
-    format!("{}-font-{}", profile_hex, font_family_idx)
+    format!(
+        "v{}-{}-font-{}",
+        PAGE_CACHE_SCHEMA_VERSION, profile_hex, font_family_idx
+    )
 }
 
 fn profile_hex(profile: PaginationProfileId) -> String {
