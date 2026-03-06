@@ -1,17 +1,18 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Cursor;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use einked::input::{Button, InputEvent};
 use einked::refresh::RefreshHint;
 use einked::render_ir::DrawCmd;
 use einked::storage::{FileStore, FileStoreError, SettingsStore};
 use einked_ereader::{DeviceConfig, EreaderRuntime, FrameSink};
+use einked_ui_harness::shared_bytes_reader::SharedBytesReader;
 use epub_stream::book::OpenConfig;
 use epub_stream::metadata::MetadataLimits;
 use epub_stream::navigation::NavigationLimits;
@@ -202,11 +203,11 @@ impl SettingsStore for TestSettings {
 }
 
 struct TestFiles {
-    files: BTreeMap<String, Vec<u8>>,
+    files: BTreeMap<String, Arc<[u8]>>,
 }
 
 impl TestFiles {
-    fn from_map(files: BTreeMap<String, Vec<u8>>) -> Self {
+    fn from_map(files: BTreeMap<String, Arc<[u8]>>) -> Self {
         Self { files }
     }
 }
@@ -250,15 +251,15 @@ impl FileStore for TestFiles {
     ) -> Result<Box<dyn einked::storage::ReadSeek>, FileStoreError> {
         let key = path.trim_start_matches('/');
         let bytes = self.files.get(key).ok_or(FileStoreError::Io)?;
-        Ok(Box::new(Cursor::new(bytes.clone())))
+        Ok(Box::new(SharedBytesReader::new(Arc::clone(bytes))))
     }
 }
 
-fn load_fixture(name: &str) -> Vec<u8> {
+fn load_fixture(name: &str) -> Arc<[u8]> {
     let base = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../../sample_books")
         .join(name);
-    fs::read(base).expect("fixture book should exist")
+    Arc::<[u8]>::from(fs::read(base).expect("fixture book should exist"))
 }
 
 fn fixture_path(name: &str) -> std::path::PathBuf {
@@ -345,7 +346,11 @@ fn epub_open_and_navigation_within_budget() {
         &mut sink,
         Some(InputEvent::Press(Button::Right)),
     );
-    let _ = step(&mut runtime, &mut sink, Some(InputEvent::Press(Button::Aux2)));
+    let _ = step(
+        &mut runtime,
+        &mut sink,
+        Some(InputEvent::Press(Button::Aux2)),
+    );
     let peak = ALLOC.peak_bytes();
     let max_single = ALLOC.max_single_alloc();
     assert!(
@@ -372,8 +377,16 @@ fn feed_navigation_within_budget() {
     let _ = step(&mut runtime, &mut sink, None);
 
     ALLOC.reset();
-    let _ = step(&mut runtime, &mut sink, Some(InputEvent::Press(Button::Right)));
-    let _ = step(&mut runtime, &mut sink, Some(InputEvent::Press(Button::Right)));
+    let _ = step(
+        &mut runtime,
+        &mut sink,
+        Some(InputEvent::Press(Button::Right)),
+    );
+    let _ = step(
+        &mut runtime,
+        &mut sink,
+        Some(InputEvent::Press(Button::Right)),
+    );
     let s = step(
         &mut runtime,
         &mut sink,

@@ -24,6 +24,8 @@ use esp_idf_svc::sys;
 use std::fs;
 #[cfg(all(feature = "std", target_os = "espidf"))]
 use std::fs::File;
+#[cfg(all(feature = "std", target_os = "espidf"))]
+use std::thread;
 
 #[cfg(feature = "std")]
 use epub_stream::book::ChapterEventsOptions;
@@ -36,7 +38,7 @@ use epub_stream::navigation::NavigationLimits;
 #[cfg(feature = "std")]
 use epub_stream::{
     EpubBook, FontLimits, LayoutHints, MemoryBudget, RenderPrepOptions, ScratchBuffers,
-    StyleConfig, StyleLimits, prewarm_inflate_state_pool,
+    StyleConfig, StyleLimits,
 };
 #[cfg(all(feature = "std", target_os = "espidf"))]
 use epub_stream::{EpubBookOptions, ValidationMode, ZipLimits};
@@ -200,11 +202,6 @@ impl EreaderRuntime {
         let theme = DefaultTheme;
         let feed_client = Rc::new(RefCell::new(feed_client));
         boot_probe(probe, "ereader_runtime:after_feed_client_rc");
-        #[cfg(all(feature = "std", target_os = "espidf"))]
-        {
-            prewarm_inflate_state_pool();
-            boot_probe(probe, "ereader_runtime:after_epub_inflate_prewarm");
-        }
         let mut ctx = Context {
             theme: &theme,
             screen: config.screen,
@@ -439,6 +436,23 @@ enum ModalState {
     },
 }
 
+#[cfg(feature = "std")]
+enum EpubNavAction {
+    PrevPage,
+    NextPage,
+    PrevChapter,
+    NextChapter,
+}
+
+#[cfg(feature = "std")]
+enum EpubOpenOutcome {
+    Opened(Box<EpubSession>),
+    Failed {
+        resources: EpubResources,
+        message: String,
+    },
+}
+
 #[derive(Clone)]
 struct FeedEntry {
     title: String,
@@ -471,6 +485,9 @@ struct EpubPageBitmap {
     generation: u32,
     bytes: *mut [u8],
 }
+
+#[cfg(feature = "std")]
+unsafe impl Send for EpubPageBitmap {}
 
 #[cfg(feature = "std")]
 impl EpubPageBitmap {
@@ -510,6 +527,7 @@ impl EpubPageBitmap {
 }
 
 #[cfg(feature = "std")]
+#[derive(Default)]
 struct EpubResources {
     page_window: Vec<RenderPage>,
     page_bitmap: Option<EpubPageBitmap>,
@@ -523,16 +541,6 @@ struct EpubReaderState {
     page_window_start: usize,
     total_pages: usize,
     page_idx: usize,
-}
-
-#[cfg(feature = "std")]
-impl Default for EpubResources {
-    fn default() -> Self {
-        Self {
-            page_window: Vec::new(),
-            page_bitmap: None,
-        }
-    }
 }
 
 #[cfg(feature = "std")]
@@ -632,7 +640,12 @@ impl HomeActivity {
     const EPUB_MAX_CACHE_PAGE_BYTES: usize = 64 * 1024;
     #[cfg(not(target_os = "espidf"))]
     const EPUB_MAX_CACHE_PAGE_BYTES: usize = 256 * 1024;
+    #[cfg(target_os = "espidf")]
+    const EPUB_OPEN_WORKER_STACK_BYTES: usize = 48 * 1024;
+    #[cfg(target_os = "espidf")]
+    const EPUB_NAV_WORKER_STACK_BYTES: usize = 32 * 1024;
 
+    #[cfg(test)]
     fn new_with_device_and_feed(
         config: DeviceConfig,
         feed_client: Rc<RefCell<Box<dyn FeedClient>>>,
@@ -730,6 +743,29 @@ impl HomeActivity {
     fn release_non_reader_state(&mut self) {
         self.files = Vec::new();
         self.feed_sources = Vec::new();
+    }
+
+    #[cfg(all(feature = "std", target_os = "espidf"))]
+    fn run_epub_worker<R, F>(name: &'static str, stack_size: usize, worker: F) -> Result<R, String>
+    where
+        R: Send + 'static,
+        F: FnOnce() -> Result<R, String> + Send + 'static,
+    {
+        let handle = thread::Builder::new()
+            .name(name.to_string())
+            .stack_size(stack_size)
+            .spawn(worker)
+            .map_err(|err| format!("Failed to start EPUB worker {name}: {err}"))?;
+        handle
+            .join()
+            .map_err(|_| format!("EPUB worker {name} panicked"))?
+    }
+
+    #[cfg(all(feature = "std", target_os = "espidf"))]
+    fn epub_worker_has_headroom(stack_size: usize) -> bool {
+        let free_heap = unsafe { sys::esp_get_free_heap_size() as usize };
+        let largest = unsafe { sys::heap_caps_get_largest_free_block(sys::MALLOC_CAP_8BIT) };
+        largest >= stack_size && free_heap >= stack_size + (16 * 1024)
     }
 
     fn ensure_feed_sources_loaded(&mut self) {
@@ -1534,6 +1570,127 @@ impl HomeActivity {
         Ok(session)
     }
 
+    #[cfg(all(feature = "std", target_os = "espidf"))]
+    fn open_epub_session_from_native_path(
+        native_path: String,
+        resources: EpubResources,
+        cfg: EpubLoadConfig,
+    ) -> Result<Box<EpubSession>, (EpubResources, String)> {
+        epub_mark!("session_open_temp_begin");
+        let options = EpubBookOptions {
+            zip_limits: Some(ZipLimits::new(256 * 1024, 128)),
+            validation_mode: ValidationMode::Lenient,
+            max_nav_bytes: Some(32 * 1024),
+            navigation_limits: NavigationLimits::embedded(),
+            metadata_limits: MetadataLimits::embedded(),
+        };
+        if let Err(err) = fs::create_dir_all("/sd/.tmp") {
+            return Err((
+                resources,
+                format!("Failed to prepare EPUB temp dir: {}", err),
+            ));
+        }
+        epub_mark!("session_open_temp_dir_ready");
+        let book = match EpubBook::open_with_temp_storage(
+            native_path.clone(),
+            "/sd/.tmp",
+            OpenConfig {
+                options,
+                lazy_navigation: true,
+            },
+        ) {
+            Ok(book) => book,
+            Err(err) => return Err((resources, format!("Failed to parse EPUB: {}", err))),
+        };
+        epub_trace!("session_open_temp_ready chapters={}", book.chapter_count());
+        if book.chapter_count() == 0 {
+            return Err((resources, "EPUB has no chapters.".to_string()));
+        }
+        let engine = Self::create_epub_engine(
+            cfg.font_size_idx,
+            cfg.auto_sleep_idx,
+            cfg.display_width,
+            cfg.display_height,
+        );
+        epub_mark!("session_engine_ready");
+        let cache = Some({
+            epub_mark!("session_cache_prepare_begin");
+            let cache = EpubPageCache::for_native_book_path(
+                &native_path,
+                engine.pagination_profile_id(),
+                cfg.font_family_idx,
+            );
+            let snapshot_event = if let Some(snapshot) = cache.load_book_snapshot() {
+                format!(
+                    "book_snapshot_cache_hit chapters={} title={}",
+                    snapshot.chapter_count, snapshot.title
+                )
+            } else {
+                "book_snapshot_cache_miss".to_string()
+            };
+            #[cfg(all(target_os = "espidf", not(debug_assertions)))]
+            let _ = &snapshot_event;
+            epub_trace!("{}", snapshot_event);
+            if Self::should_store_book_snapshot() {
+                let snapshot = CachedBookSnapshot::new(
+                    native_path.clone(),
+                    book.title().to_string(),
+                    book.author().to_string(),
+                    book.language().to_string(),
+                    book.chapter_count(),
+                    book.chapters()
+                        .map(|chapter| CachedChapterEntry {
+                            index: chapter.index,
+                            href: chapter.href,
+                            media_type: chapter.media_type,
+                        })
+                        .collect(),
+                );
+                cache.store_book_snapshot(&snapshot);
+                epub_mark!("book_snapshot_store_ready");
+            } else {
+                epub_mark!("book_snapshot_store_skipped");
+            }
+            epub_mark!("session_cache_prepare_ready");
+            cache
+        });
+        epub_mark!("session_box_begin");
+        let session = Box::new(EpubSession {
+            book: EpubSessionBook::Temp(book),
+            engine,
+            font_family_idx: cfg.font_family_idx,
+            resources,
+            reader: EpubReaderState::default(),
+            cache,
+        });
+        epub_mark!("session_box_ready");
+        Ok(session)
+    }
+
+    #[cfg(feature = "std")]
+    fn initialize_epub_session(
+        mut session: Box<EpubSession>,
+        cfg: EpubLoadConfig,
+    ) -> Result<Box<EpubSession>, (Box<EpubSession>, String)> {
+        match Self::load_epub_chapter_in_direction(&mut session, 0, 1, cfg) {
+            Some(window) => {
+                session.apply_reader_window(window, 0);
+                epub_trace!(
+                    "open_ready chapter={} chapter_count={} total_pages={} window_start={}",
+                    session.reader.chapter_idx,
+                    session.reader.chapter_count,
+                    session.reader.total_pages,
+                    session.reader.page_window_start
+                );
+                Ok(session)
+            }
+            None => Err((
+                session,
+                "No readable text produced by renderer.".to_string(),
+            )),
+        }
+    }
+
     #[cfg(feature = "std")]
     fn load_epub_chapter(
         session: &mut EpubSession,
@@ -1715,19 +1872,166 @@ impl HomeActivity {
     }
 
     #[cfg(feature = "std")]
-    fn streamed_image_options() -> StreamedImageOptions {
-        if cfg!(target_os = "espidf") {
-            StreamedImageOptions {
-                max_image_bytes: 256 * 1024,
-                max_decoded_bytes: 384 * 1024,
-                decode_png: true,
+    fn apply_epub_nav_to_session(
+        mut session: Box<EpubSession>,
+        action: EpubNavAction,
+        cfg: EpubLoadConfig,
+    ) -> Box<EpubSession> {
+        let mut changed = false;
+        match action {
+            EpubNavAction::PrevPage => {
+                if session.reader.page_idx > 0 {
+                    let page_idx = session.reader.page_idx.saturating_sub(1);
+                    session.reader.page_idx = page_idx;
+                    let chapter_idx = session.reader.chapter_idx;
+                    if page_idx < session.reader.page_window_start
+                        && let Some(window) =
+                            Self::reload_epub_page_window(&mut session, chapter_idx, page_idx, cfg)
+                    {
+                        session.apply_reader_window(window, page_idx);
+                    }
+                    changed = true;
+                } else if session.reader.chapter_idx > 0 {
+                    let next_chapter = session.reader.chapter_idx - 1;
+                    if let Some(window) =
+                        Self::load_epub_chapter_in_direction(&mut session, next_chapter, -1, cfg)
+                    {
+                        let target_page = window.total_pages.saturating_sub(1);
+                        if let Some(final_window) = Self::reload_epub_page_window(
+                            &mut session,
+                            window.chapter_idx,
+                            target_page,
+                            cfg,
+                        ) {
+                            session.apply_reader_window(final_window, target_page);
+                        } else {
+                            session.reader.chapter_idx = window.chapter_idx;
+                            session.reader.chapter_count = window.chapter_count;
+                            session.reader.total_pages = window.total_pages;
+                            session.reader.page_window_start = 0;
+                            session.reader.page_idx = 0;
+                            session.clear_page_window();
+                        }
+                        changed = true;
+                    }
+                }
+            }
+            EpubNavAction::NextPage => {
+                if session.reader.page_idx + 1 < session.reader.total_pages {
+                    let page_idx = session.reader.page_idx + 1;
+                    session.reader.page_idx = page_idx;
+                    let window_end = session.reader.page_window_start + session.page_window_len();
+                    let chapter_idx = session.reader.chapter_idx;
+                    if page_idx >= window_end
+                        && let Some(window) =
+                            Self::reload_epub_page_window(&mut session, chapter_idx, page_idx, cfg)
+                    {
+                        session.apply_reader_window(window, page_idx);
+                    }
+                    changed = true;
+                } else if session.reader.chapter_idx + 1 < session.reader.chapter_count {
+                    let next_chapter = session.reader.chapter_idx + 1;
+                    if let Some(window) =
+                        Self::load_epub_chapter_in_direction(&mut session, next_chapter, 1, cfg)
+                    {
+                        session.apply_reader_window(window, 0);
+                        changed = true;
+                    }
+                }
+            }
+            EpubNavAction::PrevChapter => {
+                if session.reader.chapter_idx > 0 {
+                    let next_chapter = session.reader.chapter_idx - 1;
+                    if let Some(window) =
+                        Self::load_epub_chapter_in_direction(&mut session, next_chapter, -1, cfg)
+                    {
+                        session.apply_reader_window(window, 0);
+                        changed = true;
+                    }
+                }
+            }
+            EpubNavAction::NextChapter => {
+                if session.reader.chapter_idx + 1 < session.reader.chapter_count {
+                    let next_chapter = session.reader.chapter_idx + 1;
+                    if let Some(window) =
+                        Self::load_epub_chapter_in_direction(&mut session, next_chapter, 1, cfg)
+                    {
+                        session.apply_reader_window(window, 0);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        let _ = changed;
+        session
+    }
+
+    #[cfg(feature = "std")]
+    fn run_epub_nav_action(&mut self, action: EpubNavAction, cfg: EpubLoadConfig) {
+        let Some(session) = self.epub_session.take() else {
+            return;
+        };
+        #[cfg(target_os = "espidf")]
+        let result = if Self::epub_worker_has_headroom(Self::EPUB_NAV_WORKER_STACK_BYTES) {
+            let EpubSession {
+                book,
+                engine,
+                font_family_idx,
+                resources,
+                reader,
+                cache,
+            } = *session;
+            let EpubResources {
+                page_window,
+                page_bitmap,
+            } = resources;
+            let worker_session = Box::new(EpubSession {
+                book,
+                engine,
+                font_family_idx,
+                resources: EpubResources {
+                    page_window,
+                    page_bitmap: None,
+                },
+                reader,
+                cache,
+            });
+            match Self::run_epub_worker("epub-nav", Self::EPUB_NAV_WORKER_STACK_BYTES, move || {
+                Ok(Self::apply_epub_nav_to_session(worker_session, action, cfg))
+            }) {
+                Ok(mut session) => {
+                    session.resources.page_bitmap = page_bitmap;
+                    Ok(session)
+                }
+                Err(message) => Err(message),
             }
         } else {
-            StreamedImageOptions {
-                max_image_bytes: 256 * 1024,
-                max_decoded_bytes: 384 * 1024,
-                decode_png: true,
+            epub_trace!("epub_nav_worker_skipped reason=low_heap");
+            Ok(Self::apply_epub_nav_to_session(session, action, cfg))
+        };
+        #[cfg(not(target_os = "espidf"))]
+        let result = Ok(Self::apply_epub_nav_to_session(session, action, cfg));
+        match result {
+            Ok(mut session) => {
+                let _ = Self::refresh_epub_page_bitmap(&mut session);
+                self.epub_session = Some(session);
             }
+            Err(message) => {
+                self.modal = ModalState::Reader {
+                    title: "EPUB".to_string(),
+                    lines: vec![message],
+                    scroll: 0,
+                };
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn streamed_image_options() -> StreamedImageOptions {
+        StreamedImageOptions {
+            max_image_bytes: 256 * 1024,
+            max_decoded_bytes: 384 * 1024,
+            decode_png: true,
         }
     }
 
@@ -1744,8 +2048,10 @@ impl HomeActivity {
         let mut framebuffer =
             PackedBinaryFrameBuffer::new(bitmap.width, bitmap.height, bitmap.bytes_mut())
                 .map_err(|err| format!("Unable to prepare EPUB framebuffer: {:?}", err))?;
-        let mut cfg = EgRenderConfig::default();
-        cfg.image_fallback = ImageFallbackPolicy::OutlineOnly;
+        let cfg = EgRenderConfig {
+            image_fallback: ImageFallbackPolicy::OutlineOnly,
+            ..Default::default()
+        };
         let renderer = EgRenderer::with_backend(cfg, MonoFontBackend);
         let diagnostics = match &mut session.book {
             #[cfg(not(target_os = "espidf"))]
@@ -1767,10 +2073,9 @@ impl HomeActivity {
             Ok(diagnostics) => (diagnostics, true),
             Err(_) => {
                 bitmap.clear();
-                let fallback = renderer
+                renderer
                     .render_page(&page, &mut framebuffer)
                     .map_err(|_| "Unable to rasterize EPUB page.".to_string())?;
-                let _ = fallback;
                 (Default::default(), false)
             }
         };
@@ -1832,45 +2137,103 @@ impl HomeActivity {
             };
             return;
         }
-        #[cfg(feature = "std")]
-        let mut session = match Self::open_epub_session(path, &mut self.epub_resources, cfg, ctx) {
-            Ok(session) => session,
-            Err(message) => {
-                self.modal = ModalState::Reader {
-                    title: path.to_string(),
-                    lines: vec![message],
-                    scroll: 0,
-                };
-                return;
+        #[cfg(all(feature = "std", target_os = "espidf"))]
+        let open_outcome = {
+            let native_path = match ctx.files.native_path(path) {
+                Some(path) => path,
+                None => {
+                    self.modal = ModalState::Reader {
+                        title: path.to_string(),
+                        lines: vec!["Failed to resolve EPUB file path.".to_string()],
+                        scroll: 0,
+                    };
+                    return;
+                }
+            };
+            let resources = core::mem::take(&mut self.epub_resources);
+            if Self::epub_worker_has_headroom(Self::EPUB_OPEN_WORKER_STACK_BYTES) {
+                match Self::run_epub_worker(
+                    "epub-open",
+                    Self::EPUB_OPEN_WORKER_STACK_BYTES,
+                    move || {
+                        Ok(
+                            match Self::open_epub_session_from_native_path(
+                                native_path,
+                                resources,
+                                cfg,
+                            ) {
+                                Ok(session) => match Self::initialize_epub_session(session, cfg) {
+                                    Ok(session) => EpubOpenOutcome::Opened(session),
+                                    Err((session, message)) => EpubOpenOutcome::Failed {
+                                        resources: session.into_resources(),
+                                        message,
+                                    },
+                                },
+                                Err((resources, message)) => {
+                                    EpubOpenOutcome::Failed { resources, message }
+                                }
+                            },
+                        )
+                    },
+                ) {
+                    Ok(mut outcome) => {
+                        if let EpubOpenOutcome::Opened(session) = &mut outcome {
+                            let _ = Self::refresh_epub_page_bitmap(session);
+                        }
+                        outcome
+                    }
+                    Err(message) => EpubOpenOutcome::Failed {
+                        resources: EpubResources::default(),
+                        message,
+                    },
+                }
+            } else {
+                epub_trace!("epub_open_worker_skipped reason=low_heap");
+                match Self::open_epub_session_from_native_path(native_path, resources, cfg) {
+                    Ok(session) => match Self::initialize_epub_session(session, cfg) {
+                        Ok(mut session) => {
+                            let _ = Self::refresh_epub_page_bitmap(&mut session);
+                            EpubOpenOutcome::Opened(session)
+                        }
+                        Err((session, message)) => EpubOpenOutcome::Failed {
+                            resources: session.into_resources(),
+                            message,
+                        },
+                    },
+                    Err((resources, message)) => EpubOpenOutcome::Failed { resources, message },
+                }
+            }
+        };
+        #[cfg(all(feature = "std", not(target_os = "espidf")))]
+        let open_outcome = {
+            match Self::open_epub_session(path, &mut self.epub_resources, cfg, ctx) {
+                Ok(session) => match Self::initialize_epub_session(session, cfg) {
+                    Ok(mut session) => {
+                        let _ = Self::refresh_epub_page_bitmap(&mut session);
+                        EpubOpenOutcome::Opened(session)
+                    }
+                    Err((session, message)) => EpubOpenOutcome::Failed {
+                        resources: session.into_resources(),
+                        message,
+                    },
+                },
+                Err(message) => EpubOpenOutcome::Failed {
+                    resources: core::mem::take(&mut self.epub_resources),
+                    message,
+                },
             }
         };
         #[cfg(feature = "std")]
-        match Self::load_epub_chapter_in_direction(&mut session, 0, 1, cfg) {
-            Some(window) => {
-                session.apply_reader_window(window, 0);
-                if let Err(err) = Self::refresh_epub_page_bitmap(&mut session) {
-                    #[cfg(all(target_os = "espidf", not(debug_assertions)))]
-                    let _ = &err;
-                    epub_trace!("page_bitmap_render_failed reason={}", err);
-                }
-                epub_trace!(
-                    "open_ready chapter={} chapter_count={} total_pages={} window_start={}",
-                    session.reader.chapter_idx,
-                    session.reader.chapter_count,
-                    session.reader.total_pages,
-                    session.reader.page_window_start
-                );
+        match open_outcome {
+            EpubOpenOutcome::Opened(session) => {
                 self.epub_session = Some(session);
                 self.modal = ModalState::EpubReader;
             }
-            None => {
-                #[cfg(feature = "std")]
-                {
-                    self.release_epub_session();
-                }
+            EpubOpenOutcome::Failed { resources, message } => {
+                self.epub_resources = resources;
                 self.modal = ModalState::Reader {
                     title: path.to_string(),
-                    lines: vec!["No readable text produced by renderer.".to_string()],
+                    lines: vec![message],
                     scroll: 0,
                 };
             }
@@ -2276,33 +2639,24 @@ impl HomeActivity {
     }
 
     #[cfg(feature = "std")]
-    fn render_epub_reader(
-        &self,
-        ui_ctx: &mut dyn Ui<DefaultTheme>,
-        chapter_idx: usize,
-        chapter_count: usize,
-        page_idx: usize,
-        total_pages: usize,
-        bitmap: Option<&EpubPageBitmap>,
-        page: Option<&RenderPage>,
-    ) {
-        if let Some(bitmap) = bitmap {
+    fn render_epub_reader(&self, ui_ctx: &mut dyn Ui<DefaultTheme>, session: &EpubSession) {
+        if let Some(bitmap) = session.resources.page_bitmap.as_ref() {
             self.draw_epub_page(
                 ui_ctx,
                 bitmap,
-                page_idx,
-                total_pages,
-                chapter_idx,
-                chapter_count,
+                session.reader.page_idx,
+                session.reader.total_pages,
+                session.reader.chapter_idx,
+                session.reader.chapter_count,
             );
-        } else if let Some(page) = page {
+        } else if let Some(page) = Self::current_epub_page(session) {
             self.draw_epub_page_fallback(
                 ui_ctx,
                 page,
-                page_idx,
-                total_pages,
-                chapter_idx,
-                chapter_count,
+                session.reader.page_idx,
+                session.reader.total_pages,
+                session.reader.chapter_idx,
+                session.reader.chapter_count,
             );
         } else {
             ui_ctx.draw_text_at(Point { x: 16, y: 26 }, "EPUB");
@@ -2413,125 +2767,22 @@ impl Activity<DefaultTheme> for HomeActivity {
                     }
                     InputEvent::Press(Button::Left) => {
                         #[cfg(feature = "std")]
-                        if let Some(session) = self.epub_session.as_mut() {
-                            if session.reader.page_idx > 0 {
-                                let page_idx = session.reader.page_idx.saturating_sub(1);
-                                session.reader.page_idx = page_idx;
-                                if page_idx < session.reader.page_window_start
-                                    && let Some(window) = Self::reload_epub_page_window(
-                                        session,
-                                        session.reader.chapter_idx,
-                                        page_idx,
-                                        epub_nav_cfg,
-                                    )
-                                {
-                                    session.apply_reader_window(window, page_idx);
-                                }
-                                let _ = Self::refresh_epub_page_bitmap(session);
-                                return Transition::Stay;
-                            }
-
-                            if session.reader.chapter_idx > 0 {
-                                let next_chapter = session.reader.chapter_idx - 1;
-                                if let Some(window) = Self::load_epub_chapter_in_direction(
-                                    session,
-                                    next_chapter,
-                                    -1,
-                                    epub_nav_cfg,
-                                ) {
-                                    let target_page = window.total_pages.saturating_sub(1);
-                                    if let Some(final_window) = Self::reload_epub_page_window(
-                                        session,
-                                        window.chapter_idx,
-                                        target_page,
-                                        epub_nav_cfg,
-                                    ) {
-                                        session.apply_reader_window(final_window, target_page);
-                                    } else {
-                                        session.reader.chapter_idx = window.chapter_idx;
-                                        session.reader.chapter_count = window.chapter_count;
-                                        session.reader.total_pages = window.total_pages;
-                                        session.reader.page_window_start = 0;
-                                        session.reader.page_idx = 0;
-                                        session.clear_page_window();
-                                    }
-                                    let _ = Self::refresh_epub_page_bitmap(session);
-                                }
-                            }
-                        }
+                        self.run_epub_nav_action(EpubNavAction::PrevPage, epub_nav_cfg);
                         Transition::Stay
                     }
                     InputEvent::Press(Button::Right) => {
                         #[cfg(feature = "std")]
-                        if let Some(session) = self.epub_session.as_mut() {
-                            if session.reader.page_idx + 1 < session.reader.total_pages {
-                                let page_idx = session.reader.page_idx + 1;
-                                session.reader.page_idx = page_idx;
-                                let window_end =
-                                    session.reader.page_window_start + session.page_window_len();
-                                if page_idx >= window_end
-                                    && let Some(window) = Self::reload_epub_page_window(
-                                        session,
-                                        session.reader.chapter_idx,
-                                        page_idx,
-                                        epub_nav_cfg,
-                                    )
-                                {
-                                    session.apply_reader_window(window, page_idx);
-                                }
-                                let _ = Self::refresh_epub_page_bitmap(session);
-                                return Transition::Stay;
-                            }
-
-                            if session.reader.chapter_idx + 1 < session.reader.chapter_count {
-                                let next_chapter = session.reader.chapter_idx + 1;
-                                if let Some(window) = Self::load_epub_chapter_in_direction(
-                                    session,
-                                    next_chapter,
-                                    1,
-                                    epub_nav_cfg,
-                                ) {
-                                    session.apply_reader_window(window, 0);
-                                    let _ = Self::refresh_epub_page_bitmap(session);
-                                }
-                            }
-                        }
+                        self.run_epub_nav_action(EpubNavAction::NextPage, epub_nav_cfg);
                         Transition::Stay
                     }
                     InputEvent::Press(Button::Aux1) => {
                         #[cfg(feature = "std")]
-                        if let Some(session) = self.epub_session.as_mut()
-                            && session.reader.chapter_idx > 0
-                        {
-                            let next_chapter = session.reader.chapter_idx - 1;
-                            if let Some(window) = Self::load_epub_chapter_in_direction(
-                                session,
-                                next_chapter,
-                                -1,
-                                epub_nav_cfg,
-                            ) {
-                                session.apply_reader_window(window, 0);
-                                let _ = Self::refresh_epub_page_bitmap(session);
-                            }
-                        }
+                        self.run_epub_nav_action(EpubNavAction::PrevChapter, epub_nav_cfg);
                         Transition::Stay
                     }
                     InputEvent::Press(Button::Aux2) => {
                         #[cfg(feature = "std")]
-                        if let Some(session) = self.epub_session.as_mut()
-                            && session.reader.chapter_idx + 1 < session.reader.chapter_count
-                        {
-                            let next_chapter = session.reader.chapter_idx + 1;
-                            if let Some(window) = Self::load_epub_chapter_in_direction(
-                                session,
-                                next_chapter,
-                                1,
-                                epub_nav_cfg,
-                            ) {
-                                session.apply_reader_window(window, 0);
-                                let _ = Self::refresh_epub_page_bitmap(session);
-                            }
-                        }
+                        self.run_epub_nav_action(EpubNavAction::NextChapter, epub_nav_cfg);
                         Transition::Stay
                     }
                     _ => Transition::Stay,
@@ -2835,15 +3086,7 @@ impl Activity<DefaultTheme> for HomeActivity {
             {
                 #[cfg(feature = "std")]
                 if let Some(session) = self.epub_session.as_ref() {
-                    self.render_epub_reader(
-                        ui_ctx,
-                        session.reader.chapter_idx,
-                        session.reader.chapter_count,
-                        session.reader.page_idx,
-                        session.reader.total_pages,
-                        session.resources.page_bitmap.as_ref(),
-                        Self::current_epub_page(session),
-                    );
+                    self.render_epub_reader(ui_ctx, session);
                 }
             }
             ModalState::FeedEntries {

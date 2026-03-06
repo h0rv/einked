@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use einked::core::Color;
 use einked::input::{Button, InputEvent};
@@ -9,6 +9,7 @@ use einked::refresh::RefreshHint;
 use einked::render_ir::DrawCmd;
 use einked::storage::{FileStore, FileStoreError, SettingsStore};
 use einked_ereader::{DeviceConfig, EreaderRuntime, FrameSink};
+use einked_ui_harness::shared_bytes_reader::SharedBytesReader;
 use font8x8::{BASIC_FONTS, UnicodeFonts};
 use image::{GrayImage, Luma};
 
@@ -60,11 +61,11 @@ impl SettingsStore for TestSettings {
 }
 
 struct TestFiles {
-    files: BTreeMap<String, Vec<u8>>,
+    files: BTreeMap<String, Arc<[u8]>>,
 }
 
 impl TestFiles {
-    fn from_map(files: BTreeMap<String, Vec<u8>>) -> Self {
+    fn from_map(files: BTreeMap<String, Arc<[u8]>>) -> Self {
         Self { files }
     }
 }
@@ -109,7 +110,7 @@ impl FileStore for TestFiles {
     ) -> Result<Box<dyn einked::storage::ReadSeek>, FileStoreError> {
         let key = path.trim_start_matches('/');
         let bytes = self.files.get(key).ok_or(FileStoreError::Io)?;
-        Ok(Box::new(Cursor::new(bytes.clone())))
+        Ok(Box::new(SharedBytesReader::new(Arc::clone(bytes))))
     }
 }
 
@@ -301,11 +302,11 @@ fn draw_text(img: &mut GrayImage, x: i32, y: i32, text: &str, color: u8) {
     }
 }
 
-fn load_fixture(name: &str) -> Vec<u8> {
+fn load_fixture(name: &str) -> Arc<[u8]> {
     let base = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../../sample_books")
         .join(name);
-    fs::read(base).expect("fixture book should exist")
+    Arc::<[u8]>::from(fs::read(base).expect("fixture book should exist"))
 }
 
 #[test]
@@ -315,7 +316,10 @@ fn library_and_epub_navigation_regression() {
         "books/pg84-frankenstein.epub".to_string(),
         load_fixture("pg84-frankenstein.epub"),
     );
-    files.insert("books/sample.txt".to_string(), b"hello\nworld\n".to_vec());
+    files.insert(
+        "books/sample.txt".to_string(),
+        Arc::<[u8]>::from(b"hello\nworld\n".as_slice()),
+    );
 
     let mut runtime = EreaderRuntime::with_backends(
         DeviceConfig::xteink_x4(),
@@ -499,7 +503,10 @@ fn feeds_modal_flow_regression() {
         "feeds_flow",
         3,
     );
-    assert!(contains_any(&s3, &["Feed Entries", "Feed Network Required"]));
+    assert!(contains_any(
+        &s3,
+        &["Feed Entries", "Feed Network Required"]
+    ));
 
     let s4 = capture(
         &mut runtime,

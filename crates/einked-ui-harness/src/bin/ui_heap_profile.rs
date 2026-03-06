@@ -1,8 +1,8 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use einked::input::{Button, InputEvent};
@@ -10,6 +10,7 @@ use einked::refresh::RefreshHint;
 use einked::render_ir::DrawCmd;
 use einked::storage::{FileStore, FileStoreError, SettingsStore};
 use einked_ereader::{DeviceConfig, EreaderRuntime, FrameSink};
+use einked_ui_harness::shared_bytes_reader::SharedBytesReader;
 
 #[global_allocator]
 static ALLOC: BudgetAlloc = BudgetAlloc::new();
@@ -180,11 +181,11 @@ impl SettingsStore for TestSettings {
 }
 
 struct TestFiles {
-    files: BTreeMap<String, Vec<u8>>,
+    files: BTreeMap<String, Arc<[u8]>>,
 }
 
 impl TestFiles {
-    fn from_map(files: BTreeMap<String, Vec<u8>>) -> Self {
+    fn from_map(files: BTreeMap<String, Arc<[u8]>>) -> Self {
         Self { files }
     }
 }
@@ -228,15 +229,15 @@ impl FileStore for TestFiles {
     ) -> Result<Box<dyn einked::storage::ReadSeek>, FileStoreError> {
         let key = path.trim_start_matches('/');
         let bytes = self.files.get(key).ok_or(FileStoreError::Io)?;
-        Ok(Box::new(Cursor::new(bytes.clone())))
+        Ok(Box::new(SharedBytesReader::new(Arc::clone(bytes))))
     }
 }
 
-fn load_fixture(name: &str) -> Vec<u8> {
+fn load_fixture(name: &str) -> Arc<[u8]> {
     let base = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../../sample_books")
         .join(name);
-    fs::read(base).expect("fixture book should exist")
+    Arc::<[u8]>::from(fs::read(base).expect("fixture book should exist"))
 }
 
 fn runtime_with_books() -> EreaderRuntime {
@@ -296,6 +297,31 @@ where
     );
 }
 
+fn profile_runtime_phase<F>(out_dir: &Path, name: &str, f: F)
+where
+    F: FnOnce(&mut EreaderRuntime, &mut CaptureSink),
+{
+    let mut runtime = runtime_with_books();
+    let mut sink = CaptureSink::new();
+    step(&mut runtime, &mut sink, None);
+
+    ALLOC.reset();
+    f(&mut runtime, &mut sink);
+
+    let peak = ALLOC.peak_bytes();
+    let allocs = ALLOC.alloc_count();
+    let max_single = ALLOC.max_single_alloc();
+    write_profile(out_dir, name, peak, allocs, max_single);
+    eprintln!(
+        "profile phase={} peak={} bytes ({:.1} KiB) allocs={} max_single={}",
+        name,
+        peak,
+        peak as f64 / 1024.0,
+        allocs,
+        max_single
+    );
+}
+
 fn parse_out_dir() -> PathBuf {
     let mut args = std::env::args().skip(1);
     let mut out_dir = PathBuf::from("target/ui-memory");
@@ -319,79 +345,36 @@ fn main() {
         step(&mut runtime, &mut sink, None);
     });
 
-    profile_phase(&out_dir, "epub_open_nav", || {
-        let mut runtime = runtime_with_books();
-        let mut sink = CaptureSink::new();
-        step(&mut runtime, &mut sink, None);
-        step(
-            &mut runtime,
-            &mut sink,
-            Some(InputEvent::Press(Button::Confirm)),
-        );
-        step(&mut runtime, &mut sink, Some(InputEvent::Press(Button::Right)));
-        step(&mut runtime, &mut sink, Some(InputEvent::Press(Button::Right)));
-        step(&mut runtime, &mut sink, Some(InputEvent::Press(Button::Aux2)));
+    profile_runtime_phase(&out_dir, "epub_open_nav", |runtime, sink| {
+        step(runtime, sink, Some(InputEvent::Press(Button::Confirm)));
+        step(runtime, sink, Some(InputEvent::Press(Button::Right)));
+        step(runtime, sink, Some(InputEvent::Press(Button::Right)));
+        step(runtime, sink, Some(InputEvent::Press(Button::Aux2)));
     });
 
-    profile_phase(&out_dir, "epub_open_first_page", || {
-        let mut runtime = runtime_with_books();
-        let mut sink = CaptureSink::new();
-        step(&mut runtime, &mut sink, None);
-        step(
-            &mut runtime,
-            &mut sink,
-            Some(InputEvent::Press(Button::Confirm)),
-        );
+    profile_runtime_phase(&out_dir, "epub_open_first_page", |runtime, sink| {
+        step(runtime, sink, Some(InputEvent::Press(Button::Confirm)));
     });
 
-    profile_phase(&out_dir, "epub_page_turn_forward", || {
-        let mut runtime = runtime_with_books();
-        let mut sink = CaptureSink::new();
-        step(&mut runtime, &mut sink, None);
-        step(
-            &mut runtime,
-            &mut sink,
-            Some(InputEvent::Press(Button::Confirm)),
-        );
-        step(&mut runtime, &mut sink, Some(InputEvent::Press(Button::Right)));
+    profile_runtime_phase(&out_dir, "epub_page_turn_forward", |runtime, sink| {
+        step(runtime, sink, Some(InputEvent::Press(Button::Confirm)));
+        step(runtime, sink, Some(InputEvent::Press(Button::Right)));
     });
 
-    profile_phase(&out_dir, "feed_nav", || {
-        let mut runtime = runtime_with_books();
-        let mut sink = CaptureSink::new();
-        step(&mut runtime, &mut sink, None);
-        step(&mut runtime, &mut sink, Some(InputEvent::Press(Button::Right)));
-        step(&mut runtime, &mut sink, Some(InputEvent::Press(Button::Right)));
-        step(
-            &mut runtime,
-            &mut sink,
-            Some(InputEvent::Press(Button::Confirm)),
-        );
-        step(
-            &mut runtime,
-            &mut sink,
-            Some(InputEvent::Press(Button::Confirm)),
-        );
+    profile_runtime_phase(&out_dir, "feed_nav", |runtime, sink| {
+        step(runtime, sink, Some(InputEvent::Press(Button::Right)));
+        step(runtime, sink, Some(InputEvent::Press(Button::Right)));
+        step(runtime, sink, Some(InputEvent::Press(Button::Confirm)));
+        step(runtime, sink, Some(InputEvent::Press(Button::Confirm)));
     });
 
-    profile_phase(&out_dir, "settings_nav", || {
-        let mut runtime = runtime_with_books();
-        let mut sink = CaptureSink::new();
-        step(&mut runtime, &mut sink, None);
-        step(&mut runtime, &mut sink, Some(InputEvent::Press(Button::Right)));
-        step(&mut runtime, &mut sink, Some(InputEvent::Press(Button::Right)));
-        step(&mut runtime, &mut sink, Some(InputEvent::Press(Button::Right)));
-        step(
-            &mut runtime,
-            &mut sink,
-            Some(InputEvent::Press(Button::Confirm)),
-        );
-        step(&mut runtime, &mut sink, Some(InputEvent::Press(Button::Down)));
-        step(
-            &mut runtime,
-            &mut sink,
-            Some(InputEvent::Press(Button::Confirm)),
-        );
+    profile_runtime_phase(&out_dir, "settings_nav", |runtime, sink| {
+        step(runtime, sink, Some(InputEvent::Press(Button::Right)));
+        step(runtime, sink, Some(InputEvent::Press(Button::Right)));
+        step(runtime, sink, Some(InputEvent::Press(Button::Right)));
+        step(runtime, sink, Some(InputEvent::Press(Button::Confirm)));
+        step(runtime, sink, Some(InputEvent::Press(Button::Down)));
+        step(runtime, sink, Some(InputEvent::Press(Button::Confirm)));
     });
 
     eprintln!(

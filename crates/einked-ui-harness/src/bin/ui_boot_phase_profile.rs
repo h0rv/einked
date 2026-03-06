@@ -1,10 +1,11 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
-use std::io::Cursor;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use einked::storage::{FileStore, FileStoreError, SettingsStore};
 use einked_ereader::{DeviceConfig, EreaderRuntime, default_feed_client};
+use einked_ui_harness::shared_bytes_reader::SharedBytesReader;
 
 #[global_allocator]
 static ALLOC: TrackingAlloc = TrackingAlloc::new();
@@ -162,7 +163,7 @@ impl SettingsStore for TestSettings {
 }
 
 struct TestFiles {
-    files: BTreeMap<String, Vec<u8>>,
+    files: BTreeMap<String, Arc<[u8]>>,
 }
 
 impl TestFiles {
@@ -213,7 +214,7 @@ impl FileStore for TestFiles {
     ) -> Result<Box<dyn einked::storage::ReadSeek>, FileStoreError> {
         let key = path.trim_start_matches('/');
         let bytes = self.files.get(key).ok_or(FileStoreError::Io)?;
-        Ok(Box::new(Cursor::new(bytes.clone())))
+        Ok(Box::new(SharedBytesReader::new(Arc::clone(bytes))))
     }
 }
 
@@ -260,13 +261,14 @@ fn main() {
         &mut probe,
     );
 
-    phases.push(snapshot("ereader_runtime:constructed", &mut previous_current));
+    phases.push(snapshot(
+        "ereader_runtime:constructed",
+        &mut previous_current,
+    ));
     drop(runtime);
     phases.push(snapshot("ereader_runtime:dropped", &mut previous_current));
 
-    println!(
-        "phase,current_bytes,delta_bytes,peak_bytes,alloc_count,max_single_alloc_bytes"
-    );
+    println!("phase,current_bytes,delta_bytes,peak_bytes,alloc_count,max_single_alloc_bytes");
     for phase in phases {
         println!(
             "{},{},{},{},{},{}",
