@@ -625,6 +625,10 @@ impl HomeActivity {
     const EPUB_MAX_CHAPTER_CACHE_BYTES: usize = 512 * 1024;
     #[cfg(not(target_os = "espidf"))]
     const EPUB_MAX_CHAPTER_CACHE_BYTES: usize = 4 * 1024 * 1024;
+    #[cfg(target_os = "espidf")]
+    const READER_FIRST_MODE: bool = true;
+    #[cfg(not(target_os = "espidf"))]
+    const READER_FIRST_MODE: bool = false;
 
     #[cfg(test)]
     fn new_with_device_and_feed(
@@ -674,6 +678,9 @@ impl HomeActivity {
     }
 
     fn build_feed_sources() -> Vec<(String, String, FeedType)> {
+        if Self::READER_FIRST_MODE {
+            return Vec::new();
+        }
         let mut feed_sources = Vec::new();
         for (name, url, ty) in all_preloaded_sources() {
             feed_sources.push((name.to_string(), url.to_string(), ty));
@@ -702,8 +709,55 @@ impl HomeActivity {
     }
 
     fn ensure_feed_sources_loaded(&mut self) {
+        if Self::READER_FIRST_MODE {
+            return;
+        }
         if self.feed_sources.is_empty() {
             self.feed_sources = Self::build_feed_sources();
+        }
+    }
+
+    fn feed_ui_enabled() -> bool {
+        !Self::READER_FIRST_MODE
+    }
+
+    fn transfer_ui_enabled() -> bool {
+        !Self::READER_FIRST_MODE
+    }
+
+    fn next_tab(&self) -> MainTab {
+        if Self::feed_ui_enabled() {
+            return self.tab.next();
+        }
+        match self.tab {
+            MainTab::Library => MainTab::Files,
+            MainTab::Files => MainTab::Settings,
+            MainTab::Feed => MainTab::Settings,
+            MainTab::Settings => MainTab::Library,
+        }
+    }
+
+    fn prev_tab(&self) -> MainTab {
+        if Self::feed_ui_enabled() {
+            return self.tab.prev();
+        }
+        match self.tab {
+            MainTab::Library => MainTab::Settings,
+            MainTab::Files => MainTab::Library,
+            MainTab::Feed => MainTab::Files,
+            MainTab::Settings => MainTab::Files,
+        }
+    }
+
+    fn tab_dot_label(&self) -> &'static str {
+        if Self::feed_ui_enabled() {
+            return self.tab.dot_label();
+        }
+        match self.tab {
+            MainTab::Library => "O o o",
+            MainTab::Files => "o O o",
+            MainTab::Feed => "o o O",
+            MainTab::Settings => "o o O",
         }
     }
 
@@ -851,7 +905,7 @@ impl HomeActivity {
     }
 
     fn library_item_count(&self) -> usize {
-        self.files.len().min(4) + 1
+        self.files.len().min(4) + usize::from(Self::transfer_ui_enabled())
     }
 
     fn refresh_files(&mut self, ctx: &mut Context<'_, DefaultTheme>) {
@@ -922,7 +976,7 @@ impl HomeActivity {
     }
 
     fn library_item_label(&self, idx: usize) -> String {
-        if idx >= self.files.len().min(4) {
+        if Self::transfer_ui_enabled() && idx >= self.files.len().min(4) {
             "File Transfer".to_string()
         } else {
             let name = &self.files[idx];
@@ -2369,13 +2423,19 @@ impl HomeActivity {
             ModalState::None => match self.tab {
                 MainTab::Library => "Back: Refresh library",
                 MainTab::Files => "Back: Up",
-                MainTab::Feed => "Back: Sources",
+                MainTab::Feed => {
+                    if Self::feed_ui_enabled() {
+                        "Back: Sources"
+                    } else {
+                        "Back: No-op"
+                    }
+                }
                 MainTab::Settings => "Back: No-op",
             },
             ModalState::EpubReader => "",
         };
         ui_ctx.draw_text_at(Point { x: 14, y: 792 }, left_hint);
-        ui_ctx.draw_text_at(Point { x: 210, y: 792 }, self.tab.dot_label());
+        ui_ctx.draw_text_at(Point { x: 210, y: 792 }, self.tab_dot_label());
         ui_ctx.draw_text_at(Point { x: 432, y: 792 }, "100%");
     }
 }
@@ -2391,7 +2451,7 @@ impl Activity<DefaultTheme> for HomeActivity {
         event: InputEvent,
         ctx: &mut Context<'_, DefaultTheme>,
     ) -> Transition<DefaultTheme> {
-        if matches!(self.tab, MainTab::Feed) {
+        if Self::feed_ui_enabled() && matches!(self.tab, MainTab::Feed) {
             self.ensure_feed_sources_loaded();
         }
         let epub_nav_cfg = EpubLoadConfig {
@@ -2654,11 +2714,11 @@ impl Activity<DefaultTheme> for HomeActivity {
 
         match event {
             InputEvent::Press(Button::Left) => {
-                self.tab = self.tab.prev();
+                self.tab = self.prev_tab();
                 Transition::Stay
             }
             InputEvent::Press(Button::Right) => {
-                self.tab = self.tab.next();
+                self.tab = self.next_tab();
                 Transition::Stay
             }
             InputEvent::Press(Button::Up) | InputEvent::Press(Button::Aux1) => {
@@ -2690,8 +2750,10 @@ impl Activity<DefaultTheme> for HomeActivity {
             }
             InputEvent::Press(Button::Confirm) => match self.tab {
                 MainTab::Library if self.library_idx + 1 == self.library_item_count() => {
-                    self.modal = ModalState::Transfer;
-                    self.transfer_menu_idx = 0;
+                    if Self::transfer_ui_enabled() {
+                        self.modal = ModalState::Transfer;
+                        self.transfer_menu_idx = 0;
+                    }
                     Transition::Stay
                 }
                 MainTab::Library => {
@@ -2708,6 +2770,9 @@ impl Activity<DefaultTheme> for HomeActivity {
                     Transition::Stay
                 }
                 MainTab::Feed => {
+                    if !Self::feed_ui_enabled() {
+                        return Transition::Stay;
+                    }
                     let source_idx = self.feed_idx.min(self.feed_sources.len().saturating_sub(1));
                     if !Self::wifi_is_active(ctx) {
                         self.show_feed_offline_modal(
