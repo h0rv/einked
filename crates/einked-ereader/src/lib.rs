@@ -20,27 +20,30 @@ use einked::storage::{FileStore, FileStoreError, SettingsStore};
 use einked::ui::runtime::UiRuntime;
 #[cfg(all(feature = "std", target_os = "espidf"))]
 use esp_idf_svc::sys;
-#[cfg(all(feature = "std", target_os = "espidf"))]
-use std::fs;
-#[cfg(all(feature = "std", target_os = "espidf"))]
+#[cfg(feature = "std")]
+use std::collections::hash_map::DefaultHasher;
+#[cfg(feature = "std")]
 use std::fs::File;
+#[cfg(feature = "std")]
+use std::hash::{Hash, Hasher};
+#[cfg(feature = "std")]
+use std::path::{Path, PathBuf};
 #[cfg(all(feature = "std", target_os = "espidf"))]
 use std::thread;
+#[cfg(feature = "std")]
+use std::time::UNIX_EPOCH;
 
 #[cfg(feature = "std")]
-use epub_stream::book::ChapterEventsOptions;
-#[cfg(all(feature = "std", target_os = "espidf"))]
 use epub_stream::book::OpenConfig;
-#[cfg(all(feature = "std", target_os = "espidf"))]
+#[cfg(feature = "std")]
 use epub_stream::metadata::MetadataLimits;
-#[cfg(all(feature = "std", target_os = "espidf"))]
+#[cfg(feature = "std")]
 use epub_stream::navigation::NavigationLimits;
 #[cfg(feature = "std")]
 use epub_stream::{
-    EpubBook, FontLimits, LayoutHints, MemoryBudget, RenderPrepOptions, ScratchBuffers,
-    StyleConfig, StyleLimits,
+    EpubBook, FontLimits, LayoutHints, MemoryBudget, RenderPrepOptions, StyleConfig, StyleLimits,
 };
-#[cfg(all(feature = "std", target_os = "espidf"))]
+#[cfg(feature = "std")]
 use epub_stream::{EpubBookOptions, ValidationMode, ZipLimits};
 #[cfg(feature = "std")]
 use epub_stream_embedded_graphics::{
@@ -49,12 +52,9 @@ use epub_stream_embedded_graphics::{
 };
 #[cfg(feature = "std")]
 use epub_stream_render::{
-    DrawCommand as EpubDrawCommand, HyphenationMode, JustificationStrategy, RenderConfig,
-    RenderEngine, RenderEngineOptions, RenderPage,
+    DrawCommand as EpubDrawCommand, FileRenderCacheStore, HyphenationMode, JustificationStrategy,
+    RenderCacheStore, RenderConfig, RenderEngine, RenderEngineOptions, RenderPage,
 };
-
-#[cfg(feature = "std")]
-mod epub_cache;
 
 pub mod embedded_fonts;
 pub mod feed;
@@ -63,10 +63,6 @@ pub mod feed_browser;
 pub use embedded_fonts::{
     BOOKERLY_BOLD, BOOKERLY_BOLD_ITALIC, BOOKERLY_ITALIC, BOOKERLY_REGULAR, BOOKERLY_SET,
     EmbeddedFont,
-};
-#[cfg(feature = "std")]
-use epub_cache::{
-    CachedBookSnapshot, CachedChapterEntry, CachedPageRecord, CachedRenderPage, EpubPageCache,
 };
 pub use feed::{
     FeedClient, FeedEntryData, FeedSource, FeedType, JINA_READER_BASE, NoopFeedClient, OpdsCatalog,
@@ -483,11 +479,8 @@ struct EpubPageBitmap {
     width: u32,
     height: u32,
     generation: u32,
-    bytes: *mut [u8],
+    bytes: Box<[u8]>,
 }
-
-#[cfg(feature = "std")]
-unsafe impl Send for EpubPageBitmap {}
 
 #[cfg(feature = "std")]
 impl EpubPageBitmap {
@@ -500,7 +493,7 @@ impl EpubPageBitmap {
             width,
             height,
             generation: 0,
-            bytes: Box::into_raw(bytes),
+            bytes,
         })
     }
 
@@ -513,16 +506,12 @@ impl EpubPageBitmap {
         self.generation
     }
 
-    fn bytes(&self) -> &'static [u8] {
-        // SAFETY: the backing slice is leaked in `new`, so the pointer remains valid
-        // for the process lifetime. Callers only take shared views from this method.
-        unsafe { &*self.bytes }
+    fn bytes(&self) -> &[u8] {
+        &self.bytes
     }
 
-    fn bytes_mut(&mut self) -> &'static mut [u8] {
-        // SAFETY: the backing slice is leaked in `new`, so the pointer remains valid
-        // for the process lifetime. `&mut self` guarantees unique access while drawing.
-        unsafe { &mut *self.bytes }
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes
     }
 }
 
@@ -550,14 +539,13 @@ struct EpubSession {
     font_family_idx: usize,
     resources: EpubResources,
     reader: EpubReaderState,
-    cache: Option<EpubPageCache>,
+    cache: Option<FileRenderCacheStore>,
 }
 
 #[cfg(feature = "std")]
 enum EpubSessionBook {
     #[cfg(not(target_os = "espidf"))]
     Generic(EpubBook<Box<dyn einked::storage::ReadSeek>>),
-    #[cfg(target_os = "espidf")]
     Temp(EpubBook<File>),
 }
 
@@ -629,17 +617,9 @@ impl HomeActivity {
     #[cfg(not(target_os = "espidf"))]
     const EPUB_PAGE_WINDOW: usize = 6;
     #[cfg(target_os = "espidf")]
-    const EPUB_MAX_CHAPTER_EVENTS: usize = 8_192;
+    const EPUB_MAX_CHAPTER_CACHE_BYTES: usize = 512 * 1024;
     #[cfg(not(target_os = "espidf"))]
-    const EPUB_MAX_CHAPTER_EVENTS: usize = 65_536;
-    #[cfg(target_os = "espidf")]
-    const EPUB_MAX_CHAPTER_BUF_CAPACITY_BYTES: usize = 64 * 1024;
-    #[cfg(not(target_os = "espidf"))]
-    const EPUB_MAX_CHAPTER_BUF_CAPACITY_BYTES: usize = 512 * 1024;
-    #[cfg(target_os = "espidf")]
-    const EPUB_MAX_CACHE_PAGE_BYTES: usize = 64 * 1024;
-    #[cfg(not(target_os = "espidf"))]
-    const EPUB_MAX_CACHE_PAGE_BYTES: usize = 256 * 1024;
+    const EPUB_MAX_CHAPTER_CACHE_BYTES: usize = 4 * 1024 * 1024;
     #[cfg(target_os = "espidf")]
     const EPUB_OPEN_WORKER_STACK_BYTES: usize = 48 * 1024;
     #[cfg(target_os = "espidf")]
@@ -1119,55 +1099,6 @@ impl HomeActivity {
     }
 
     #[cfg(feature = "std")]
-    fn cacheable_epub_page(page: &RenderPage) -> CachedRenderPage {
-        CachedRenderPage::from(page)
-    }
-
-    #[cfg(feature = "std")]
-    fn cacheable_book_snapshot(book: &EpubSessionBook, source_path: &str) -> CachedBookSnapshot {
-        let (title, author, language, chapter_count, chapters) = match book {
-            #[cfg(not(target_os = "espidf"))]
-            EpubSessionBook::Generic(inner) => (
-                inner.title().to_string(),
-                inner.author().to_string(),
-                inner.language().to_string(),
-                inner.chapter_count(),
-                inner
-                    .chapters()
-                    .map(|chapter| CachedChapterEntry {
-                        index: chapter.index,
-                        href: chapter.href,
-                        media_type: chapter.media_type,
-                    })
-                    .collect(),
-            ),
-            #[cfg(target_os = "espidf")]
-            EpubSessionBook::Temp(inner) => (
-                inner.title().to_string(),
-                inner.author().to_string(),
-                inner.language().to_string(),
-                inner.chapter_count(),
-                inner
-                    .chapters()
-                    .map(|chapter| CachedChapterEntry {
-                        index: chapter.index,
-                        href: chapter.href,
-                        media_type: chapter.media_type,
-                    })
-                    .collect(),
-            ),
-        };
-        CachedBookSnapshot::new(
-            source_path.to_string(),
-            title,
-            author,
-            language,
-            chapter_count,
-            chapters,
-        )
-    }
-
-    #[cfg(feature = "std")]
     #[allow(dead_code)]
     fn log_epub_event(event: &str) {
         let _ = event;
@@ -1190,18 +1121,86 @@ impl HomeActivity {
     }
 
     #[cfg(feature = "std")]
-    fn should_store_book_snapshot() -> bool {
-        #[cfg(target_os = "espidf")]
-        {
-            let free_heap = unsafe { sys::esp_get_free_heap_size() } as usize;
-            let largest_8bit =
-                unsafe { sys::heap_caps_get_largest_free_block(sys::MALLOC_CAP_8BIT) } as usize;
-            free_heap >= 40 * 1024 && largest_8bit >= 16 * 1024
+    fn render_cache_store(
+        native_path: &str,
+        _profile: epub_stream_render::PaginationProfileId,
+        font_family_idx: usize,
+    ) -> FileRenderCacheStore {
+        FileRenderCacheStore::new(Self::render_cache_root_for_book(
+            native_path,
+            font_family_idx,
+        ))
+        .with_max_file_bytes(Self::EPUB_MAX_CHAPTER_CACHE_BYTES)
+    }
+
+    #[cfg(feature = "std")]
+    fn render_cache_root_for_book(native_path: &str, font_family_idx: usize) -> PathBuf {
+        let path = Path::new(native_path);
+        let storage_root = if native_path == "/sd" || native_path.starts_with("/sd/") {
+            PathBuf::from("/sd")
+        } else {
+            path.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        };
+        storage_root
+            .join(".xteink")
+            .join("epub-cache")
+            .join(Self::book_cache_key(native_path))
+            .join(format!("font-{}", font_family_idx))
+    }
+
+    #[cfg(feature = "std")]
+    fn book_cache_key(native_path: &str) -> String {
+        let mut hasher = DefaultHasher::new();
+        native_path.hash(&mut hasher);
+        if let Ok(meta) = std::fs::metadata(native_path) {
+            meta.len().hash(&mut hasher);
+            if let Ok(modified) = meta.modified()
+                && let Ok(duration) = modified.duration_since(UNIX_EPOCH)
+            {
+                duration.as_secs().hash(&mut hasher);
+                duration.subsec_nanos().hash(&mut hasher);
+            }
         }
-        #[cfg(not(target_os = "espidf"))]
-        {
-            true
+        format!("{:016x}", hasher.finish())
+    }
+
+    #[cfg(feature = "std")]
+    fn epub_temp_root_for_native_path(native_path: &str) -> PathBuf {
+        if native_path == "/sd" || native_path.starts_with("/sd/") {
+            PathBuf::from("/sd/.tmp")
+        } else {
+            std::env::temp_dir().join("xteink-epub")
         }
+    }
+
+    #[cfg(feature = "std")]
+    fn epub_open_config() -> OpenConfig {
+        OpenConfig {
+            options: EpubBookOptions {
+                zip_limits: Some(ZipLimits::new(256 * 1024, 128)),
+                validation_mode: ValidationMode::Lenient,
+                max_nav_bytes: Some(32 * 1024),
+                navigation_limits: NavigationLimits::embedded(),
+                metadata_limits: MetadataLimits::embedded(),
+            },
+            lazy_navigation: true,
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn open_temp_backed_epub_book(native_path: &str) -> Result<EpubBook<File>, String> {
+        let temp_root = Self::epub_temp_root_for_native_path(native_path);
+        std::fs::create_dir_all(&temp_root).map_err(|err| {
+            format!(
+                "Failed to create EPUB temp dir {}: {}",
+                temp_root.display(),
+                err
+            )
+        })?;
+        EpubBook::open_with_temp_storage(native_path, &temp_root, Self::epub_open_config())
+            .map_err(|err| format!("Failed to parse EPUB: {}", err))
     }
 
     #[cfg(feature = "std")]
@@ -1280,58 +1279,25 @@ impl HomeActivity {
         match book {
             #[cfg(not(target_os = "espidf"))]
             EpubSessionBook::Generic(inner) => inner.chapter_count(),
-            #[cfg(target_os = "espidf")]
             EpubSessionBook::Temp(inner) => inner.chapter_count(),
         }
     }
 
     #[cfg(feature = "std")]
-    fn session_chapter_uncompressed_size(
-        session: &mut EpubSession,
-        chapter_idx: usize,
-    ) -> Result<usize, epub_stream::EpubError> {
-        match &mut session.book {
-            #[cfg(not(target_os = "espidf"))]
-            EpubSessionBook::Generic(inner) => inner.chapter_uncompressed_size(chapter_idx),
-            #[cfg(target_os = "espidf")]
-            EpubSessionBook::Temp(inner) => inner.chapter_uncompressed_size(chapter_idx),
+    fn annotate_cached_chapter_page(page: &mut RenderPage, chapter_idx: usize, page_count: usize) {
+        let page_count = page_count.max(1);
+        page.metrics.chapter_index = chapter_idx;
+        page.metrics.chapter_page_index = page.page_number.saturating_sub(1);
+        page.metrics.chapter_page_count = Some(page_count);
+        page.metrics.global_page_index = Some(page.metrics.chapter_page_index);
+        page.metrics.global_page_count_estimate = Some(page_count);
+        page.metrics.progress_chapter = if page_count <= 1 {
+            1.0
+        } else {
+            page.metrics.chapter_page_index as f32 / (page_count - 1) as f32
         }
-    }
-
-    #[cfg(feature = "std")]
-    fn session_page_cache(session: &EpubSession) -> Option<&EpubPageCache> {
-        session.cache.as_ref()
-    }
-
-    #[cfg(feature = "std")]
-    fn ensure_epub_chapter_capacity(
-        session: &mut EpubSession,
-        chapter_idx: usize,
-    ) -> Result<Vec<u8>, String> {
-        let Ok(required_bytes) = Self::session_chapter_uncompressed_size(session, chapter_idx)
-        else {
-            let fallback = Self::EPUB_MAX_CHAPTER_BUF_CAPACITY_BYTES.min(32 * 1024);
-            epub_trace!(
-                "chapter_size_unknown chapter={} allocating_fallback={}",
-                chapter_idx,
-                fallback
-            );
-            return Self::try_epub_chapter_buf(fallback);
-        };
-        epub_trace!(
-            "chapter_size chapter={} required={} cap={}",
-            chapter_idx,
-            required_bytes,
-            Self::EPUB_MAX_CHAPTER_BUF_CAPACITY_BYTES
-        );
-        if required_bytes > Self::EPUB_MAX_CHAPTER_BUF_CAPACITY_BYTES {
-            return Err(format!(
-                "Unable to stream EPUB chapter: required {} bytes exceeds chapter buffer cap {} bytes",
-                required_bytes,
-                Self::EPUB_MAX_CHAPTER_BUF_CAPACITY_BYTES
-            ));
-        }
-        Self::try_epub_chapter_buf(required_bytes)
+        .clamp(0.0, 1.0);
+        page.metrics.progress_book = Some(page.metrics.progress_chapter);
     }
 
     #[cfg(feature = "std")]
@@ -1339,105 +1305,48 @@ impl HomeActivity {
         session: &mut EpubSession,
         chapter_idx: usize,
         page_idx: usize,
-        cfg: EpubLoadConfig,
+        _cfg: EpubLoadConfig,
     ) -> Result<Option<(RenderPage, usize)>, String> {
         epub_trace!("page_load_begin chapter={} page={}", chapter_idx, page_idx);
-        if let Some(cache) = Self::session_page_cache(session)
-            && let Some(record) = cache.load_page(chapter_idx, page_idx)
+        let profile = session.engine.pagination_profile_id();
+        let cache = session.cache.clone();
+        if let Some(cache) = cache.as_ref()
+            && let Some(total_pages) = cache.load_chapter_page_count(profile, chapter_idx)
+            && let Some(mut page) = cache.load_chapter_page(profile, chapter_idx, page_idx)
         {
+            Self::annotate_cached_chapter_page(&mut page, chapter_idx, total_pages);
             epub_trace!(
                 "page_cache_hit chapter={} page={} total_pages={}",
                 chapter_idx,
                 page_idx,
-                record.total_pages
+                total_pages
             );
-            return Ok(Some((record.page.into(), record.total_pages.max(1))));
+            return Ok(Some((page, total_pages.max(1))));
         }
 
-        let mut chapter_buf = Self::ensure_epub_chapter_capacity(session, chapter_idx)?;
-        epub_trace!(
-            "page_load_chapter_buf_ready chapter={} page={} capacity={}",
-            chapter_idx,
-            page_idx,
-            chapter_buf.capacity()
-        );
-        let mut chapter_scratch = Self::try_embedded_scratch_buffers()?;
-        epub_trace!(
-            "page_load_scratch_ready chapter={} page={} read_cap={} xml_cap={} text_cap={}",
-            chapter_idx,
-            page_idx,
-            chapter_scratch.read_buf.capacity(),
-            chapter_scratch.xml_buf.capacity(),
-            chapter_scratch.text_buf.capacity()
-        );
-        let chapter_opts = ChapterEventsOptions {
-            render: Self::epub_render_prep_options(cfg.font_size_idx),
-            max_items: Self::EPUB_MAX_CHAPTER_EVENTS,
-        };
-        let config = RenderConfig::default()
+        let mut config = RenderConfig::default()
             .with_forced_font_family(Self::epub_forced_font_family(session.font_family_idx))
             .with_page_range(page_idx..page_idx + 1);
-        let mut render_session = session.engine.begin(chapter_idx, config);
-        let mut target_page: Option<RenderPage> = None;
-        let mut layout_error: Option<String> = None;
-        let mut on_item = |item| {
-            if layout_error.is_some() || target_page.is_some() {
-                return Ok::<(), epub_stream::EpubError>(());
-            }
-            if let Err(err) = render_session.push(item) {
-                layout_error = Some(err.to_string());
-                return Ok::<(), epub_stream::EpubError>(());
-            }
-            render_session.drain_pages(|page| {
-                if target_page.is_none() {
-                    target_page = Some(page);
-                }
-            });
-            Ok::<(), epub_stream::EpubError>(())
-        };
+        if let Some(cache) = cache.as_ref() {
+            config = config.with_cache(cache);
+        }
         epub_trace!(
             "page_load_stream_begin chapter={} page={}",
             chapter_idx,
             page_idx
         );
-        let stream_result = match &mut session.book {
+        let pages = match &mut session.book {
             #[cfg(not(target_os = "espidf"))]
-            EpubSessionBook::Generic(inner) => inner
-                .chapter_events_with_scratch(
-                    chapter_idx,
-                    chapter_opts,
-                    &mut chapter_buf,
-                    &mut chapter_scratch,
-                    &mut on_item,
-                )
-                .map(|_| ()),
-            #[cfg(target_os = "espidf")]
-            EpubSessionBook::Temp(inner) => inner
-                .chapter_events_with_scratch(
-                    chapter_idx,
-                    chapter_opts,
-                    &mut chapter_buf,
-                    &mut chapter_scratch,
-                    &mut on_item,
-                )
-                .map(|_| ()),
+            EpubSessionBook::Generic(inner) => session
+                .engine
+                .prepare_chapter_with_config_collect(inner, chapter_idx, config)
+                .map_err(|err| format!("Unable to layout EPUB chapter: {}", err))?,
+            EpubSessionBook::Temp(inner) => session
+                .engine
+                .prepare_chapter_with_config_collect(inner, chapter_idx, config)
+                .map_err(|err| format!("Unable to layout EPUB chapter: {}", err))?,
         };
-        if let Err(err) = stream_result {
-            return Err(format!("Unable to stream EPUB chapter: {}", err));
-        }
-        if let Some(err) = layout_error {
-            return Err(format!("Unable to layout EPUB chapter: {}", err));
-        }
-        render_session
-            .finish()
-            .map_err(|e| format!("Unable to finalize EPUB chapter layout: {}", e))?;
-        render_session.drain_pages(|page| {
-            if target_page.is_none() {
-                target_page = Some(page);
-            }
-        });
-
-        let Some(page) = target_page else {
+        let Some(page) = pages.into_iter().next() else {
             return Ok(None);
         };
         let total_pages = page
@@ -1445,16 +1354,6 @@ impl HomeActivity {
             .chapter_page_count
             .unwrap_or(page_idx + 1)
             .max(1);
-        let cached_page = Self::cacheable_epub_page(&page);
-        if let Some(cache) = Self::session_page_cache(session) {
-            let record =
-                CachedPageRecord::new(chapter_idx, page_idx, total_pages, cached_page.clone());
-            if let Some(bytes) = EpubPageCache::serialize_page(&record)
-                && bytes.len() <= Self::EPUB_MAX_CACHE_PAGE_BYTES
-            {
-                cache.store_page_bytes(&record, &bytes);
-            }
-        }
         epub_trace!(
             "page_load_ready chapter={} page={} total_pages={} streamed=true",
             chapter_idx,
@@ -1464,57 +1363,41 @@ impl HomeActivity {
         Ok(Some((page, total_pages)))
     }
 
-    #[cfg(feature = "std")]
+    #[cfg(all(feature = "std", not(target_os = "espidf")))]
     fn open_epub_session(
         path: &str,
         resources: &mut EpubResources,
         cfg: EpubLoadConfig,
         ctx: &mut Context<'_, DefaultTheme>,
     ) -> Result<Box<EpubSession>, String> {
-        #[cfg(target_os = "espidf")]
         let book = {
-            epub_mark!("session_open_temp_begin");
-            let options = EpubBookOptions {
-                zip_limits: Some(ZipLimits::new(256 * 1024, 128)),
-                validation_mode: ValidationMode::Lenient,
-                max_nav_bytes: Some(32 * 1024),
-                navigation_limits: NavigationLimits::embedded(),
-                metadata_limits: MetadataLimits::embedded(),
-            };
-            let native_path = ctx
-                .files
-                .native_path(path)
-                .ok_or_else(|| "Failed to resolve EPUB file path.".to_string())?;
-            fs::create_dir_all("/sd/.tmp")
-                .map_err(|err| format!("Failed to prepare EPUB temp dir: {}", err))?;
-            epub_mark!("session_open_temp_dir_ready");
-            let book = EpubBook::open_with_temp_storage(
-                native_path,
-                "/sd/.tmp",
-                OpenConfig {
-                    options,
-                    lazy_navigation: true,
-                },
-            )
-            .map_err(|err| format!("Failed to parse EPUB: {}", err))?;
-            epub_trace!("session_open_temp_ready chapters={}", book.chapter_count());
-            EpubSessionBook::Temp(book)
-        };
-        #[cfg(not(target_os = "espidf"))]
-        let book = {
-            epub_mark!("session_open_generic_begin");
-            let reader = ctx
-                .files
-                .open_read_seek(path)
-                .map_err(|_| "Failed to open EPUB file.".to_string())?;
-            let book = EpubBook::builder()
-                .from_reader(reader)
-                .map_err(|err| format!("Failed to parse EPUB: {}", err))?;
-            epub_trace!(
-                "session_open_generic_ready chapters={}",
-                book.chapter_count()
-            );
-            EpubSessionBook::Generic(book)
+            if let Some(native_path) = ctx.files.native_path(path) {
+                epub_mark!("session_open_temp_begin");
+                let book = Self::open_temp_backed_epub_book(&native_path)?;
+                epub_trace!("session_open_temp_ready chapters={}", book.chapter_count());
+                EpubSessionBook::Temp(book)
+            } else {
+                #[cfg(target_os = "espidf")]
+                {
+                    return Err("Failed to resolve EPUB file path.".to_string());
+                }
+                #[cfg(not(target_os = "espidf"))]
+                {
+                    epub_mark!("session_open_generic_begin");
+                    let reader = ctx
+                        .files
+                        .open_read_seek(path)
+                        .map_err(|_| "Failed to open EPUB file.".to_string())?;
+                    let book = EpubBook::builder()
+                        .from_reader(reader)
+                        .map_err(|err| format!("Failed to parse EPUB: {}", err))?;
+                    epub_trace!(
+                        "session_open_generic_ready chapters={}",
+                        book.chapter_count()
+                    );
+                    EpubSessionBook::Generic(book)
+                }
+            }
         };
         if Self::book_chapter_count(&book) == 0 {
             return Err("EPUB has no chapters.".to_string());
@@ -1532,28 +1415,11 @@ impl HomeActivity {
         epub_mark!("session_engine_ready");
         let cache = ctx.files.native_path(path).map(|native_path| {
             epub_mark!("session_cache_prepare_begin");
-            let cache = EpubPageCache::for_native_book_path(
+            let cache = Self::render_cache_store(
                 &native_path,
                 engine.pagination_profile_id(),
                 cfg.font_family_idx,
             );
-            let snapshot_event = if let Some(snapshot) = cache.load_book_snapshot() {
-                format!(
-                    "book_snapshot_cache_hit chapters={} title={}",
-                    snapshot.chapter_count, snapshot.title
-                )
-            } else {
-                "book_snapshot_cache_miss".to_string()
-            };
-            #[cfg(all(target_os = "espidf", not(debug_assertions)))]
-            let _ = &snapshot_event;
-            epub_trace!("{}", snapshot_event);
-            if Self::should_store_book_snapshot() {
-                cache.store_book_snapshot(&Self::cacheable_book_snapshot(&book, &native_path));
-                epub_mark!("book_snapshot_store_ready");
-            } else {
-                epub_mark!("book_snapshot_store_skipped");
-            }
             epub_mark!("session_cache_prepare_ready");
             cache
         });
@@ -1577,30 +1443,9 @@ impl HomeActivity {
         cfg: EpubLoadConfig,
     ) -> Result<Box<EpubSession>, (EpubResources, String)> {
         epub_mark!("session_open_temp_begin");
-        let options = EpubBookOptions {
-            zip_limits: Some(ZipLimits::new(256 * 1024, 128)),
-            validation_mode: ValidationMode::Lenient,
-            max_nav_bytes: Some(32 * 1024),
-            navigation_limits: NavigationLimits::embedded(),
-            metadata_limits: MetadataLimits::embedded(),
-        };
-        if let Err(err) = fs::create_dir_all("/sd/.tmp") {
-            return Err((
-                resources,
-                format!("Failed to prepare EPUB temp dir: {}", err),
-            ));
-        }
-        epub_mark!("session_open_temp_dir_ready");
-        let book = match EpubBook::open_with_temp_storage(
-            native_path.clone(),
-            "/sd/.tmp",
-            OpenConfig {
-                options,
-                lazy_navigation: true,
-            },
-        ) {
+        let book = match Self::open_temp_backed_epub_book(&native_path) {
             Ok(book) => book,
-            Err(err) => return Err((resources, format!("Failed to parse EPUB: {}", err))),
+            Err(err) => return Err((resources, err)),
         };
         epub_trace!("session_open_temp_ready chapters={}", book.chapter_count());
         if book.chapter_count() == 0 {
@@ -1615,42 +1460,11 @@ impl HomeActivity {
         epub_mark!("session_engine_ready");
         let cache = Some({
             epub_mark!("session_cache_prepare_begin");
-            let cache = EpubPageCache::for_native_book_path(
+            let cache = Self::render_cache_store(
                 &native_path,
                 engine.pagination_profile_id(),
                 cfg.font_family_idx,
             );
-            let snapshot_event = if let Some(snapshot) = cache.load_book_snapshot() {
-                format!(
-                    "book_snapshot_cache_hit chapters={} title={}",
-                    snapshot.chapter_count, snapshot.title
-                )
-            } else {
-                "book_snapshot_cache_miss".to_string()
-            };
-            #[cfg(all(target_os = "espidf", not(debug_assertions)))]
-            let _ = &snapshot_event;
-            epub_trace!("{}", snapshot_event);
-            if Self::should_store_book_snapshot() {
-                let snapshot = CachedBookSnapshot::new(
-                    native_path.clone(),
-                    book.title().to_string(),
-                    book.author().to_string(),
-                    book.language().to_string(),
-                    book.chapter_count(),
-                    book.chapters()
-                        .map(|chapter| CachedChapterEntry {
-                            index: chapter.index,
-                            href: chapter.href,
-                            media_type: chapter.media_type,
-                        })
-                        .collect(),
-                );
-                cache.store_book_snapshot(&snapshot);
-                epub_mark!("book_snapshot_store_ready");
-            } else {
-                epub_mark!("book_snapshot_store_skipped");
-            }
             epub_mark!("session_cache_prepare_ready");
             cache
         });
@@ -1732,35 +1546,6 @@ impl HomeActivity {
         let mut buf = Vec::new();
         buf.try_reserve_exact(capacity).map_err(|_| ())?;
         Ok(buf)
-    }
-
-    #[cfg(feature = "std")]
-    fn try_alloc_string(capacity: usize) -> Result<String, ()> {
-        let mut buf = String::new();
-        buf.try_reserve_exact(capacity).map_err(|_| ())?;
-        Ok(buf)
-    }
-
-    #[cfg(feature = "std")]
-    fn try_embedded_scratch_buffers() -> Result<ScratchBuffers, String> {
-        Ok(ScratchBuffers {
-            read_buf: Self::try_alloc_vec(8192)
-                .map_err(|_| "Unable to allocate EPUB read scratch buffer.".to_string())?,
-            xml_buf: Self::try_alloc_vec(4096)
-                .map_err(|_| "Unable to allocate EPUB XML scratch buffer.".to_string())?,
-            text_buf: Self::try_alloc_string(2048)
-                .map_err(|_| "Unable to allocate EPUB text scratch buffer.".to_string())?,
-        })
-    }
-
-    #[cfg(feature = "std")]
-    fn try_epub_chapter_buf(capacity: usize) -> Result<Vec<u8>, String> {
-        Self::try_alloc_vec(capacity).map_err(|_| {
-            format!(
-                "Unable to allocate {} bytes for EPUB chapter buffer",
-                capacity
-            )
-        })
     }
 
     #[cfg(feature = "std")]
@@ -1973,36 +1758,10 @@ impl HomeActivity {
         };
         #[cfg(target_os = "espidf")]
         let result = if Self::epub_worker_has_headroom(Self::EPUB_NAV_WORKER_STACK_BYTES) {
-            let EpubSession {
-                book,
-                engine,
-                font_family_idx,
-                resources,
-                reader,
-                cache,
-            } = *session;
-            let EpubResources {
-                page_window,
-                page_bitmap,
-            } = resources;
-            let worker_session = Box::new(EpubSession {
-                book,
-                engine,
-                font_family_idx,
-                resources: EpubResources {
-                    page_window,
-                    page_bitmap: None,
-                },
-                reader,
-                cache,
-            });
             match Self::run_epub_worker("epub-nav", Self::EPUB_NAV_WORKER_STACK_BYTES, move || {
-                Ok(Self::apply_epub_nav_to_session(worker_session, action, cfg))
+                Ok(Self::apply_epub_nav_to_session(session, action, cfg))
             }) {
-                Ok(mut session) => {
-                    session.resources.page_bitmap = page_bitmap;
-                    Ok(session)
-                }
+                Ok(session) => Ok(session),
                 Err(message) => Err(message),
             }
         } else {
@@ -2061,7 +1820,6 @@ impl HomeActivity {
                 &mut framebuffer,
                 Self::streamed_image_options(),
             ),
-            #[cfg(target_os = "espidf")]
             EpubSessionBook::Temp(inner) => renderer.render_page_with_streamed_images(
                 inner,
                 &page,
@@ -2072,7 +1830,7 @@ impl HomeActivity {
         let (diagnostics, streamed_images) = match diagnostics {
             Ok(diagnostics) => (diagnostics, true),
             Err(_) => {
-                bitmap.clear();
+                framebuffer.as_bytes_mut().fill(0);
                 renderer
                     .render_page(&page, &mut framebuffer)
                     .map_err(|_| "Unable to rasterize EPUB page.".to_string())?;
@@ -2438,7 +2196,9 @@ impl HomeActivity {
                 width: bitmap.width as u16,
                 height: bitmap.height as u16,
             },
-            bitmap.bytes(),
+            // SAFETY: the bitmap is session-owned and outlives the queued draw commands
+            // for this frame; the UI runtime only borrows the slice until flush.
+            unsafe { core::mem::transmute::<&[u8], &'static [u8]>(bitmap.bytes()) },
             ImageFormat::Mono1bpp,
             bitmap.generation,
         );
