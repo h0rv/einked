@@ -455,12 +455,6 @@ enum EpubNavAction {
     NextChapter,
 }
 
-#[cfg(feature = "std")]
-enum EpubOpenOutcome {
-    Opened(Box<EpubSession>),
-    Failed { message: String },
-}
-
 #[derive(Clone)]
 struct FeedEntry {
     title: String,
@@ -1651,7 +1645,7 @@ impl HomeActivity {
             return;
         }
         #[cfg(all(feature = "std", target_os = "espidf"))]
-        let open_outcome = {
+        let session_result = {
             let native_path = match ctx.files.native_path(path) {
                 Some(path) => path,
                 None => {
@@ -1663,32 +1657,20 @@ impl HomeActivity {
                     return;
                 }
             };
-            match Self::open_epub_session_from_native_path(native_path, cfg) {
-                Ok(session) => match Self::initialize_epub_session(session) {
-                    Ok(session) => EpubOpenOutcome::Opened(session),
-                    Err(message) => EpubOpenOutcome::Failed { message },
-                },
-                Err(message) => EpubOpenOutcome::Failed { message },
-            }
+            Self::open_epub_session_from_native_path(native_path, cfg)
+                .and_then(Self::initialize_epub_session)
         };
         #[cfg(all(feature = "std", not(target_os = "espidf")))]
-        let open_outcome = {
-            match Self::open_epub_session(path, cfg, ctx) {
-                Ok(session) => match Self::initialize_epub_session(session) {
-                    Ok(session) => EpubOpenOutcome::Opened(session),
-                    Err(message) => EpubOpenOutcome::Failed { message },
-                },
-                Err(message) => EpubOpenOutcome::Failed { message },
-            }
-        };
+        let session_result =
+            Self::open_epub_session(path, cfg, ctx).and_then(Self::initialize_epub_session);
         #[cfg(feature = "std")]
-        match open_outcome {
-            EpubOpenOutcome::Opened(session) => {
+        match session_result {
+            Ok(session) => {
                 self.epub_session = Some(session);
                 self.modal = ModalState::EpubReader;
                 self.refresh_debug_snapshot();
             }
-            EpubOpenOutcome::Failed { message } => {
+            Err(message) => {
                 self.modal = ModalState::Reader {
                     title: path.to_string(),
                     lines: vec![message],
