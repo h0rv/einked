@@ -8,6 +8,7 @@ use heapless::Vec;
 use crate::core::{Color, Point, Rect, Theme};
 use crate::input::{InputEvent, InputSource};
 use crate::refresh::RefreshHint;
+use crate::render_ir::ImageFormat;
 use crate::storage::{FileStore, SettingsStore};
 
 pub trait Ui<T: Theme> {
@@ -22,6 +23,14 @@ pub trait Ui<T: Theme> {
     fn draw_text_at(&mut self, _pos: Point, _text: &str) {}
     fn fill_rect(&mut self, _rect: Rect, _color: Color) {}
     fn draw_line(&mut self, _start: Point, _end: Point, _color: Color, _width: u8) {}
+    fn draw_image(
+        &mut self,
+        _rect: Rect,
+        _data: &'static [u8],
+        _format: ImageFormat,
+        _generation: u32,
+    ) {
+    }
 }
 
 impl<T: Theme> Ui<T> for () {}

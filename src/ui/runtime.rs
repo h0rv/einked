@@ -3,7 +3,7 @@
 use crate::core::{Color, FontStyle, FontWeight, LineHeight, Point, Rect, TextStyle};
 use crate::dsl::{RefreshMode as DslRefreshMode, StackOpts, UiDsl};
 use crate::refresh::RefreshHint;
-use crate::render_ir::{CmdBuffer, DrawCmd, DrawTextBuf};
+use crate::render_ir::{CmdBuffer, DrawCmd, DrawTextBuf, ImageFormat};
 use crate::ui::theme::Theme;
 
 /// Runtime that records DSL/component output into a fixed command buffer.
@@ -119,6 +119,24 @@ impl<'rt, const N: usize> UiRuntime<'rt, N> {
                 width,
             },
             region,
+        );
+    }
+
+    pub fn draw_image(
+        &mut self,
+        rect: Rect,
+        data: &'static [u8],
+        format: ImageFormat,
+        generation: u32,
+    ) {
+        let _ = self.cmds.push(
+            DrawCmd::DrawImage {
+                rect,
+                data,
+                format,
+                generation,
+            },
+            rect,
         );
     }
 

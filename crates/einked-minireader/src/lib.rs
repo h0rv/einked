@@ -13,7 +13,7 @@ use einked::dsl::UiDsl;
 use einked::input::{Button, InputEvent};
 use einked::pipeline::FramePipeline;
 use einked::refresh::RefreshHint;
-use einked::render_ir::DrawCmd;
+use einked::render_ir::{DrawCmd, ImageFormat};
 use einked::storage::{FileStore, SettingsStore};
 use einked::ui::runtime::UiRuntime;
 
@@ -171,6 +171,16 @@ impl Ui<DefaultTheme> for RuntimeUi<'_> {
     }
     fn draw_line(&mut self, start: Point, end: Point, color: Color, width: u8) {
         self.runtime.draw_line(start, end, color, width);
+    }
+
+    fn draw_image(
+        &mut self,
+        rect: Rect,
+        data: &'static [u8],
+        format: ImageFormat,
+        generation: u32,
+    ) {
+        self.runtime.draw_image(rect, data, format, generation);
     }
 }
 

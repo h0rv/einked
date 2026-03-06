@@ -8,13 +8,7 @@ use std::time::UNIX_EPOCH;
 use epub_stream_render::PaginationProfileId;
 use serde::{Deserialize, Serialize};
 
-pub type CachedDrawCommand = epub_stream_render::persisted::PersistedDrawCommand;
-pub type CachedImageObjectCommand = epub_stream_render::persisted::PersistedImageObjectCommand;
-pub type CachedPageChromeKind = epub_stream_render::persisted::PersistedPageChromeKind;
-pub type CachedRectCommand = epub_stream_render::persisted::PersistedRectCommand;
 pub type CachedRenderPage = epub_stream_render::persisted::PersistedRenderPage;
-pub type CachedRuleCommand = epub_stream_render::persisted::PersistedRuleCommand;
-pub type CachedTextCommand = epub_stream_render::persisted::PersistedTextCommand;
 
 const PAGE_CACHE_SCHEMA_VERSION: u8 = 3;
 

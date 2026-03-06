@@ -39,6 +39,7 @@ pub enum DrawCmd<'a> {
         rect: Rect,
         data: &'a [u8],
         format: ImageFormat,
+        generation: u32,
     },
     Clip {
         rect: Rect,

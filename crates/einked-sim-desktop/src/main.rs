@@ -10,7 +10,7 @@ use embedded_graphics_simulator::{
 use einked::core::Color;
 use einked::input::{Button, InputEvent};
 use einked::refresh::RefreshHint;
-use einked::render_ir::DrawCmd;
+use einked::render_ir::{DrawCmd, ImageFormat};
 use einked::storage::{FileStore, FileStoreError, SettingsStore};
 use einked_ereader::{DeviceConfig, EreaderRuntime, FrameSink};
 use std::io::Read;
@@ -201,7 +201,54 @@ fn rasterize_commands(cmds: &[DrawCmd<'static>], display: &mut SimulatorDisplay<
                 .into_styled(PrimitiveStyle::with_fill(to_binary(*color)))
                 .draw(display);
             }
-            DrawCmd::DrawImage { .. } | DrawCmd::Clip { .. } | DrawCmd::Unclip => {}
+            DrawCmd::DrawImage {
+                rect, data, format, ..
+            } => draw_image(display, *rect, data, *format),
+            DrawCmd::Clip { .. } | DrawCmd::Unclip => {}
+        }
+    }
+}
+
+fn draw_image(
+    display: &mut SimulatorDisplay<BinaryColor>,
+    rect: einked::core::Rect,
+    data: &[u8],
+    format: ImageFormat,
+) {
+    match format {
+        ImageFormat::Mono1bpp => {
+            let stride = (rect.width as usize).div_ceil(8);
+            let _ = display.draw_iter((0..rect.height as usize).flat_map(|y| {
+                let row = data
+                    .get(y.saturating_mul(stride)..((y + 1).saturating_mul(stride)).min(data.len()))
+                    .unwrap_or(&[]);
+                (0..rect.width as usize).map(move |x| {
+                    let byte = row.get(x / 8).copied().unwrap_or(0);
+                    let bit = 7 - (x % 8);
+                    let color = if (byte >> bit) & 1 == 1 {
+                        BinaryColor::On
+                    } else {
+                        BinaryColor::Off
+                    };
+                    Pixel(Point::new(rect.x as i32 + x as i32, rect.y as i32 + y as i32), color)
+                })
+            }));
+        }
+        ImageFormat::Gray8 => {
+            let stride = rect.width as usize;
+            let _ = display.draw_iter((0..rect.height as usize).flat_map(|y| {
+                let row = data
+                    .get(y.saturating_mul(stride)..((y + 1).saturating_mul(stride)).min(data.len()))
+                    .unwrap_or(&[]);
+                (0..rect.width as usize).map(move |x| {
+                    let color = if row.get(x).copied().unwrap_or(255) < 128 {
+                        BinaryColor::On
+                    } else {
+                        BinaryColor::Off
+                    };
+                    Pixel(Point::new(rect.x as i32 + x as i32, rect.y as i32 + y as i32), color)
+                })
+            }));
         }
     }
 }
