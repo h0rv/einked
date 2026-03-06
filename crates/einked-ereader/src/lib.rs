@@ -490,9 +490,9 @@ struct EpubReaderState {
 #[cfg(feature = "std")]
 struct EpubSession {
     load_cfg: EpubLoadConfig,
-    book: EpubSessionBook,
+    book: Box<EpubSessionBook>,
     engine: Box<RenderEngine>,
-    current_page: Option<RenderPage>,
+    current_page: Option<Box<RenderPage>>,
     reader: EpubReaderState,
     cache_root: Option<PathBuf>,
 }
@@ -1306,7 +1306,7 @@ impl HomeActivity {
         if let Some(cache) = cache {
             config = config.with_cache(cache);
         }
-        match &mut session.book {
+        match session.book.as_mut() {
             #[cfg(not(target_os = "espidf"))]
             EpubSessionBook::Generic(inner) => session
                 .engine
@@ -1376,7 +1376,7 @@ impl HomeActivity {
             return Ok(false);
         };
         let chapter_count = session.reader.chapter_count.max(1);
-        session.current_page = Some(page);
+        session.current_page = Some(Box::new(page));
         session.set_reader_position(chapter_idx, chapter_count, total_pages, page_idx);
         Ok(true)
     }
@@ -1423,7 +1423,7 @@ impl HomeActivity {
                 page = last_page;
                 total_pages = final_total_pages;
             }
-            session.current_page = Some(page);
+            session.current_page = Some(Box::new(page));
             session.set_reader_position(chapter_idx, chapter_count, total_pages, final_page_idx);
             return Ok(true);
         }
@@ -1470,7 +1470,7 @@ impl HomeActivity {
         epub_mark!("session_box_begin");
         let mut session = Box::new(EpubSession {
             load_cfg: cfg,
-            book,
+            book: Box::new(book),
             engine: Box::new(Self::session_engine_for_config(cfg)),
             current_page: None,
             reader: EpubReaderState::default(),
@@ -1496,7 +1496,7 @@ impl HomeActivity {
         epub_mark!("session_box_begin");
         let mut session = Box::new(EpubSession {
             load_cfg: cfg,
-            book: EpubSessionBook::Temp(book),
+            book: Box::new(EpubSessionBook::Temp(book)),
             engine: Box::new(Self::session_engine_for_config(cfg)),
             current_page: None,
             reader: EpubReaderState::default(),
