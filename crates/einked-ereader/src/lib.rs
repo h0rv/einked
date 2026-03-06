@@ -76,8 +76,7 @@ pub trait FrameSink {
 #[cfg(feature = "std")]
 macro_rules! epub_mark {
     ($msg:expr) => {{
-        #[cfg(any(not(target_os = "espidf"), debug_assertions))]
-        {
+        if Self::epub_runtime_trace_enabled() {
             Self::log_epub_event($msg);
         }
     }};
@@ -86,8 +85,7 @@ macro_rules! epub_mark {
 #[cfg(feature = "std")]
 macro_rules! epub_trace {
     ($($arg:tt)*) => {{
-        #[cfg(any(not(target_os = "espidf"), debug_assertions))]
-        {
+        if Self::epub_runtime_trace_enabled() {
             Self::log_epub_event(&format!($($arg)*));
         }
     }};
@@ -431,6 +429,7 @@ enum ModalState {
 }
 
 #[cfg(feature = "std")]
+#[derive(Debug, Clone, Copy)]
 enum EpubNavAction {
     PrevPage,
     NextPage,
@@ -545,8 +544,8 @@ enum EpubSessionSource {
 
 #[cfg(feature = "std")]
 struct EpubTransientWorker {
-    book: EpubSessionBook,
-    engine: RenderEngine,
+    book: Box<EpubSessionBook>,
+    engine: Box<RenderEngine>,
 }
 
 #[cfg(feature = "std")]
@@ -1038,6 +1037,20 @@ impl HomeActivity {
 
     #[cfg(feature = "std")]
     #[allow(dead_code)]
+    fn epub_runtime_trace_enabled() -> bool {
+        #[cfg(target_os = "espidf")]
+        {
+            true
+        }
+
+        #[cfg(not(target_os = "espidf"))]
+        {
+            cfg!(debug_assertions)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[allow(dead_code)]
     fn log_epub_event(event: &str) {
         let _ = event;
         #[cfg(target_os = "espidf")]
@@ -1239,18 +1252,21 @@ impl HomeActivity {
     }
 
     #[cfg(feature = "std")]
-    fn worker_from_open_book(session: &EpubSession, book: EpubSessionBook) -> EpubTransientWorker {
-        EpubTransientWorker {
-            book,
-            engine: Self::transient_engine_for_session(session),
-        }
+    fn worker_from_open_book(
+        session: &EpubSession,
+        book: EpubSessionBook,
+    ) -> Box<EpubTransientWorker> {
+        Box::new(EpubTransientWorker {
+            book: Box::new(book),
+            engine: Box::new(Self::transient_engine_for_session(session)),
+        })
     }
 
     #[cfg(feature = "std")]
     fn transient_worker_for_session(
         session: &EpubSession,
         ctx: &mut Context<'_, DefaultTheme>,
-    ) -> Result<EpubTransientWorker, String> {
+    ) -> Result<Box<EpubTransientWorker>, String> {
         let book = Self::transient_book_for_session(session, ctx)?;
         Ok(Self::worker_from_open_book(session, book))
     }
@@ -1273,6 +1289,81 @@ impl HomeActivity {
     }
 
     #[cfg(feature = "std")]
+    #[inline(never)]
+    fn prepare_epub_chapter_page(
+        worker: &mut EpubTransientWorker,
+        session: &EpubSession,
+        chapter_idx: usize,
+        page_idx: usize,
+        cache: Option<&FileRenderCacheStore>,
+    ) -> Result<Vec<RenderPage>, String> {
+        let mut config = RenderConfig::default()
+            .with_embedded_fonts(false)
+            .with_forced_font_family(Self::epub_forced_font_family(session.font_family_idx()))
+            .with_page_range(page_idx..page_idx + 1);
+        if let Some(cache) = cache {
+            config = config.with_cache(cache);
+        }
+        match worker.book.as_mut() {
+            #[cfg(not(target_os = "espidf"))]
+            EpubSessionBook::Generic(inner) => worker
+                .engine
+                .prepare_chapter_with_config_collect(inner, chapter_idx, config)
+                .map_err(|err| format!("Unable to layout EPUB chapter: {}", err)),
+            EpubSessionBook::Temp(inner) => worker
+                .engine
+                .prepare_chapter_with_config_collect(inner, chapter_idx, config)
+                .map_err(|err| format!("Unable to layout EPUB chapter: {}", err)),
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[inline(never)]
+    fn rasterize_epub_page_to_bitmap(
+        worker: &mut EpubTransientWorker,
+        page: &RenderPage,
+        framebuffer: &mut PackedBinaryFrameBuffer<'_>,
+    ) -> Result<
+        (
+            epub_stream_embedded_graphics::StreamedImageDiagnostics,
+            bool,
+        ),
+        String,
+    > {
+        let cfg = EgRenderConfig {
+            image_fallback: ImageFallbackPolicy::OutlineOnly,
+            ..Default::default()
+        };
+        let renderer = EgRenderer::with_backend(cfg, MonoFontBackend);
+        let diagnostics = match worker.book.as_mut() {
+            #[cfg(not(target_os = "espidf"))]
+            EpubSessionBook::Generic(inner) => renderer.render_page_with_streamed_images(
+                inner,
+                page,
+                framebuffer,
+                Self::streamed_image_options(),
+            ),
+            EpubSessionBook::Temp(inner) => renderer.render_page_with_streamed_images(
+                inner,
+                page,
+                framebuffer,
+                Self::streamed_image_options(),
+            ),
+        };
+        match diagnostics {
+            Ok(diagnostics) => Ok((diagnostics, true)),
+            Err(_) => {
+                framebuffer.as_bytes_mut().fill(0);
+                renderer
+                    .render_page(page, framebuffer)
+                    .map_err(|_| "Unable to rasterize EPUB page.".to_string())?;
+                Ok((Default::default(), false))
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[inline(never)]
     fn load_epub_page_with_worker(
         session: &EpubSession,
         worker: &mut EpubTransientWorker,
@@ -1299,29 +1390,18 @@ impl HomeActivity {
             return Ok(Some((page, total_pages.max(1))));
         }
 
-        let mut config = RenderConfig::default()
-            .with_embedded_fonts(false)
-            .with_forced_font_family(Self::epub_forced_font_family(session.font_family_idx()))
-            .with_page_range(page_idx..page_idx + 1);
-        if let Some(cache) = cache.as_ref() {
-            config = config.with_cache(cache);
-        }
         epub_trace!(
             "page_load_stream_begin chapter={} page={}",
             chapter_idx,
             page_idx
         );
-        let pages = match &mut worker.book {
-            #[cfg(not(target_os = "espidf"))]
-            EpubSessionBook::Generic(inner) => worker
-                .engine
-                .prepare_chapter_with_config_collect(inner, chapter_idx, config)
-                .map_err(|err| format!("Unable to layout EPUB chapter: {}", err))?,
-            EpubSessionBook::Temp(inner) => worker
-                .engine
-                .prepare_chapter_with_config_collect(inner, chapter_idx, config)
-                .map_err(|err| format!("Unable to layout EPUB chapter: {}", err))?,
-        };
+        let pages = Self::prepare_epub_chapter_page(
+            worker,
+            session,
+            chapter_idx,
+            page_idx,
+            cache.as_ref(),
+        )?;
         let Some(page) = pages.into_iter().next() else {
             return Ok(None);
         };
@@ -1357,7 +1437,7 @@ impl HomeActivity {
         resources: &mut EpubResources,
         cfg: EpubLoadConfig,
         ctx: &mut Context<'_, DefaultTheme>,
-    ) -> Result<(Box<EpubSession>, EpubTransientWorker), String> {
+    ) -> Result<(Box<EpubSession>, Box<EpubTransientWorker>), String> {
         let (source, chapter_count, book) = {
             if let Some(native_path) = ctx.files.native_path(path) {
                 epub_mark!("session_open_temp_begin");
@@ -1421,7 +1501,7 @@ impl HomeActivity {
         native_path: String,
         resources: EpubResources,
         cfg: EpubLoadConfig,
-    ) -> Result<(Box<EpubSession>, EpubTransientWorker), (EpubResources, String)> {
+    ) -> Result<(Box<EpubSession>, Box<EpubTransientWorker>), (EpubResources, String)> {
         epub_mark!("session_open_temp_begin");
         let book = match Self::open_temp_backed_epub_book(&native_path) {
             Ok(book) => book,
@@ -1451,10 +1531,12 @@ impl HomeActivity {
     }
 
     #[cfg(feature = "std")]
+    #[inline(never)]
     fn initialize_epub_session(
         mut session: Box<EpubSession>,
         worker: &mut EpubTransientWorker,
     ) -> Result<Box<EpubSession>, (Box<EpubSession>, String)> {
+        epub_mark!("session_init_begin");
         match Self::find_readable_epub_chapter_with_worker(&mut session, worker, 0, 1) {
             Some((chapter_idx, total_pages)) => {
                 let chapter_count = session.chapter_count;
@@ -1465,6 +1547,7 @@ impl HomeActivity {
                     session.reader.chapter_count,
                     session.reader.total_pages
                 );
+                epub_mark!("session_init_ready");
                 Ok(session)
             }
             None => Err((
@@ -1528,6 +1611,7 @@ impl HomeActivity {
     }
 
     #[cfg(feature = "std")]
+    #[inline(never)]
     fn find_readable_epub_chapter_with_worker(
         session: &mut EpubSession,
         worker: &mut EpubTransientWorker,
@@ -1553,12 +1637,20 @@ impl HomeActivity {
     }
 
     #[cfg(feature = "std")]
+    #[inline(never)]
     fn apply_epub_nav_to_session(
         mut session: Box<EpubSession>,
         ctx: &mut Context<'_, DefaultTheme>,
         action: EpubNavAction,
         cfg: EpubLoadConfig,
     ) -> Box<EpubSession> {
+        epub_trace!(
+            "nav_begin action={:?} chapter={} page={} total_pages={}",
+            action,
+            session.reader.chapter_idx,
+            session.reader.page_idx,
+            session.reader.total_pages
+        );
         let chapter_count = session.reader.chapter_count.max(session.chapter_count);
         match action {
             EpubNavAction::PrevPage => {
@@ -1612,6 +1704,13 @@ impl HomeActivity {
                 }
             }
         }
+        epub_trace!(
+            "nav_ready action={:?} chapter={} page={} total_pages={}",
+            action,
+            session.reader.chapter_idx,
+            session.reader.page_idx,
+            session.reader.total_pages
+        );
         session
     }
 
@@ -1671,6 +1770,7 @@ impl HomeActivity {
         session: &mut EpubSession,
         worker: &mut EpubTransientWorker,
     ) -> Result<(), String> {
+        epub_mark!("page_bitmap_refresh_begin");
         Self::ensure_epub_page_bitmap(session);
         let Some((page, total_pages)) = Self::load_epub_page_with_worker(
             session,
@@ -1682,6 +1782,12 @@ impl HomeActivity {
             return Ok(());
         };
         session.reader.total_pages = total_pages.max(1);
+        epub_trace!(
+            "page_bitmap_refresh_loaded chapter={} page={} total_pages={}",
+            session.reader.chapter_idx,
+            session.reader.page_idx,
+            session.reader.total_pages
+        );
         let Some(bitmap) = session.resources.page_bitmap.as_mut() else {
             return Ok(());
         };
@@ -1689,36 +1795,9 @@ impl HomeActivity {
         let mut framebuffer =
             PackedBinaryFrameBuffer::new(bitmap.width, bitmap.height, bitmap.bytes_mut())
                 .map_err(|err| format!("Unable to prepare EPUB framebuffer: {:?}", err))?;
-        let cfg = EgRenderConfig {
-            image_fallback: ImageFallbackPolicy::OutlineOnly,
-            ..Default::default()
-        };
-        let renderer = EgRenderer::with_backend(cfg, MonoFontBackend);
-        let diagnostics = match &mut worker.book {
-            #[cfg(not(target_os = "espidf"))]
-            EpubSessionBook::Generic(inner) => renderer.render_page_with_streamed_images(
-                inner,
-                &page,
-                &mut framebuffer,
-                Self::streamed_image_options(),
-            ),
-            EpubSessionBook::Temp(inner) => renderer.render_page_with_streamed_images(
-                inner,
-                &page,
-                &mut framebuffer,
-                Self::streamed_image_options(),
-            ),
-        };
-        let (diagnostics, streamed_images) = match diagnostics {
-            Ok(diagnostics) => (diagnostics, true),
-            Err(_) => {
-                framebuffer.as_bytes_mut().fill(0);
-                renderer
-                    .render_page(&page, &mut framebuffer)
-                    .map_err(|_| "Unable to rasterize EPUB page.".to_string())?;
-                (Default::default(), false)
-            }
-        };
+        epub_mark!("page_bitmap_render_begin");
+        let (diagnostics, streamed_images) =
+            Self::rasterize_epub_page_to_bitmap(worker, &page, &mut framebuffer)?;
         let generation = bitmap.next_generation();
         #[cfg(all(target_os = "espidf", not(debug_assertions)))]
         {
@@ -1741,6 +1820,7 @@ impl HomeActivity {
             diagnostics.unsupported_sources,
             diagnostics.resource_errors
         );
+        epub_mark!("page_bitmap_refresh_ready");
         Ok(())
     }
 
