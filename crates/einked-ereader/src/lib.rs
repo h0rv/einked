@@ -1859,10 +1859,7 @@ impl HomeActivity {
             let resources = core::mem::take(&mut self.epub_resources);
             match Self::open_epub_session_from_native_path(native_path, resources, cfg) {
                 Ok(session) => match Self::initialize_epub_session(session, ctx, cfg) {
-                    Ok(mut session) => {
-                        let _ = Self::refresh_epub_page_bitmap(&mut session, ctx);
-                        EpubOpenOutcome::Opened(session)
-                    }
+                    Ok(session) => EpubOpenOutcome::Opened(session),
                     Err((session, message)) => EpubOpenOutcome::Failed {
                         resources: session.into_resources(),
                         message,
@@ -1875,10 +1872,7 @@ impl HomeActivity {
         let open_outcome = {
             match Self::open_epub_session(path, &mut self.epub_resources, cfg, ctx) {
                 Ok(session) => match Self::initialize_epub_session(session, ctx, cfg) {
-                    Ok(mut session) => {
-                        let _ = Self::refresh_epub_page_bitmap(&mut session, ctx);
-                        EpubOpenOutcome::Opened(session)
-                    }
+                    Ok(session) => EpubOpenOutcome::Opened(session),
                     Err((session, message)) => EpubOpenOutcome::Failed {
                         resources: session.into_resources(),
                         message,
